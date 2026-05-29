@@ -417,9 +417,11 @@ Linting requires the following tools and Cargo packages to be installed:
 * npx (`brew install node`)
 * helm-docs (`brew install norwoodj/tap/helm-docs`)
 * trufflehog (`brew install trufflehog`)
+* gnu-sed (`brew install gnu-sed`)
 * cargo-about (`cargo install cargo-about`)
 * cargo-deplint (`cargo install cargo-deplint`)
 * cargo-deny (`cargo install cargo-deny`)
+* zizmor (`cargo install --locked zizmor@1.18.0`)
 
 ## Submitting and reviewing changes
 
