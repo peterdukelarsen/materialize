@@ -15,6 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use azdls::AzureStorageScheme;
+
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -607,6 +609,7 @@ pub enum IcebergCatalogAuth<C: ConnectionAccess = InlinedConnection> {
         scope: Option<String>,
     },
     Gcp(GcpConnectionReference<C>),
+    Azdls(),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -931,6 +934,12 @@ impl IcebergCatalogConnection<InlinedConnection> {
                     Some(iceberg_catalog_rest::BearerTokenAuthenticator::new(
                         Arc::new(GcpTokenProvider { service_account }),
                     )),
+                )
+            }
+            IcebergCatalogAuth::Azdls() => {
+                (
+                    OpenDalStorageFactory::Azdls { configured_scheme: AzureStorageScheme::Abfss },
+                    None,
                 )
             }
         };
