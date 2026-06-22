@@ -292,6 +292,20 @@ def workflow_large_upsert_batch(c: Composition) -> None:
     )
 
 
+def workflow_copy_numeric_max_scale(c: Composition) -> None:
+    """A numeric column with a max scale (numeric(38, 1)) must round values
+    ingested via COPY INTO down to that scale before they reach the Iceberg
+    sink. DuckDB authors a Parquet file holding a two-decimal value (1.29); the
+    rounded value (1.3) must land in the Iceberg decimal(38, 1) column."""
+    key = _setup(c)
+
+    c.run_testdrive_files(
+        f"--var=s3-access-key={key}",
+        "--var=aws-endpoint=minio:9000",
+        "copy-numeric-max-scale.td",
+    )
+
+
 def workflow_range_noncanonical(c: Composition) -> None:
     """Regression test for database-issues#11330: COPY FROM PARQUET must
     canonicalize range values reconstructed from external Parquet, otherwise
