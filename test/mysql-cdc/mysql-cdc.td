@@ -561,6 +561,7 @@ DROP TABLE IF EXISTS pk_range_test;
 CREATE TABLE pk_range_test (id BIGINT PRIMARY KEY, val BIGINT);
 SET @i := 0;
 INSERT INTO pk_range_test SELECT @i := @i + 1, @i * 7 FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 1000;
+ANALYZE TABLE pk_range_test;
 
 > CREATE CLUSTER pk_range_cluster SIZE 'scale=1,workers=4'
 
@@ -592,7 +593,8 @@ $ mysql-execute name=mysql
 DROP TABLE pk_range_test;
 
 #
-# Same, but for a single-column non-integer (char) PK.
+# Same, but for a single-column non-integer (char) PK. These take the
+# sampled-boundary split path rather than the MIN/MAX fast path.
 #
 
 $ mysql-execute name=mysql
@@ -600,6 +602,7 @@ DROP TABLE IF EXISTS pk_char_test;
 CREATE TABLE pk_char_test (id CHAR(26) PRIMARY KEY, val BIGINT);
 SET @i := 0;
 INSERT INTO pk_char_test SELECT LPAD(CONV(@i := @i + 1, 10, 36), 26, '0'), @i FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 1000;
+ANALYZE TABLE pk_char_test;
 
 > CREATE CLUSTER pk_char_cluster SIZE 'scale=1,workers=4'
 
@@ -608,7 +611,7 @@ INSERT INTO pk_char_test SELECT LPAD(CONV(@i := @i + 1, 10, 36), 26, '0'), @i FR
   FROM MYSQL CONNECTION mysql_conn;
 > CREATE TABLE pk_char_table FROM SOURCE pk_char_source (REFERENCE public.pk_char_test);
 
-# Exact count and no duplicate/missing keys
+# Exact count and no duplicate/missing keys across the parallel ranges
 > SELECT COUNT(*), COUNT(DISTINCT id) FROM pk_char_table;
 1000 1000
 
@@ -623,7 +626,8 @@ $ mysql-execute name=mysql
 DROP TABLE pk_char_test;
 
 #
-# Same, but for a composite (char, int) primary key.
+# Composite PKs are not supported for the parallel split, so this table falls back
+# to a single-worker snapshot. Verify that fallback still returns correct results.
 #
 
 $ mysql-execute name=mysql
@@ -666,6 +670,7 @@ DROP TABLE IF EXISTS pk_surplus_test;
 CREATE TABLE pk_surplus_test (id CHAR(26) PRIMARY KEY, val BIGINT);
 SET @i := 0;
 INSERT INTO pk_surplus_test SELECT LPAD(CONV(@i := @i + 1, 10, 36), 26, '0'), @i FROM mysql.time_zone t1 LIMIT 3;
+ANALYZE TABLE pk_surplus_test;
 
 > CREATE CLUSTER pk_surplus_cluster SIZE 'scale=1,workers=16'
 
@@ -674,7 +679,7 @@ INSERT INTO pk_surplus_test SELECT LPAD(CONV(@i := @i + 1, 10, 36), 26, '0'), @i
   FROM MYSQL CONNECTION mysql_conn;
 > CREATE TABLE pk_surplus_table FROM SOURCE pk_surplus_source (REFERENCE public.pk_surplus_test);
 
-# All rows present exactly once
+# All rows present exactly once, none duplicated by a surplus worker
 > SELECT COUNT(*), COUNT(DISTINCT id) FROM pk_surplus_table;
 3 3
 
@@ -689,7 +694,41 @@ $ mysql-execute name=mysql
 DROP TABLE pk_surplus_test;
 
 #
-# Empty table.
+# Stale approximate count: ANALYZE at 500 rows, then insert 500 more. The snapshot
+# must still read every row (the extra rows fall into the last open-ended range).
+#
+
+$ mysql-execute name=mysql
+DROP TABLE IF EXISTS pk_stale_test;
+CREATE TABLE pk_stale_test (id BIGINT PRIMARY KEY, val BIGINT);
+SET @i := 0;
+INSERT INTO pk_stale_test SELECT @i := @i + 1, @i FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 500;
+ANALYZE TABLE pk_stale_test;
+INSERT INTO pk_stale_test SELECT @i := @i + 1, @i FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 500;
+
+> CREATE CLUSTER pk_stale_cluster SIZE 'scale=1,workers=4'
+
+> CREATE SOURCE pk_stale_source
+  IN CLUSTER pk_stale_cluster
+  FROM MYSQL CONNECTION mysql_conn;
+> CREATE TABLE pk_stale_table FROM SOURCE pk_stale_source (REFERENCE public.pk_stale_test);
+
+# All 1000 rows present exactly once, though the estimate reflected only ~500
+> SELECT COUNT(*), COUNT(DISTINCT id) FROM pk_stale_table;
+1000 1000
+
+> SELECT MIN(id), MAX(id) FROM pk_stale_table;
+1 1000
+
+> DROP SOURCE pk_stale_source CASCADE;
+> DROP CLUSTER pk_stale_cluster CASCADE;
+
+$ mysql-execute name=mysql
+DROP TABLE pk_stale_test;
+
+#
+# Empty table: there are no PK boundaries to sample, so partitioning falls back
+# to a single responsible worker that reads the (empty) table.
 #
 
 $ mysql-execute name=mysql
@@ -713,8 +752,10 @@ $ mysql-execute name=mysql
 DROP TABLE pk_empty_test;
 
 #
-# BIGINT UNSIGNED PK with keys spanning the full unsigned domain, including
-# values above i64::MAX.
+# BIGINT UNSIGNED PK: excluded from the integer MIN/MAX split (whose bounds are
+# read as i64) and routed to the sampled-boundary path. Half the keys sit above
+# i64::MAX, so a partition boundary lands in the u64-only range and the range
+# predicates must compare across the full unsigned domain.
 #
 
 $ mysql-execute name=mysql
@@ -732,7 +773,7 @@ INSERT INTO pk_uint_test SELECT 18446744073709551115 + (@j := @j + 1), -@j FROM 
   FROM MYSQL CONNECTION mysql_conn;
 > CREATE TABLE pk_uint_table FROM SOURCE pk_uint_source (REFERENCE public.pk_uint_test);
 
-# Exact count and no duplicate/missing keys
+# Exact count and no duplicate/missing keys across the parallel ranges
 > SELECT COUNT(*), COUNT(DISTINCT id) FROM pk_uint_table;
 1000 1000
 
@@ -753,7 +794,8 @@ DROP TABLE pk_uint_test;
 #
 # Multibyte utf8mb4 PK with a binary collation. Keys mix 2-, 3-, and 4-byte code
 # points (accented Latin, Greek, CJK, and emoji), assembled from their utf8 bytes
-# so the test file stays ASCII.
+# so the test file stays ASCII. The sampled-boundary split QUOTEs and compares
+# these keys, so it must round-trip them without losing or duplicating rows.
 #
 
 $ mysql-execute name=mysql
@@ -761,6 +803,7 @@ DROP TABLE IF EXISTS pk_charset_test;
 CREATE TABLE pk_charset_test (id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY, val BIGINT);
 SET @i := 0;
 INSERT INTO pk_charset_test SELECT CONCAT(ELT((n % 6) + 1, CHAR(0xC3B1 USING utf8mb4), CHAR(0xCEA9 USING utf8mb4), CHAR(0xE4B8AD USING utf8mb4), CHAR(0xE7958C USING utf8mb4), CHAR(0xF09F9880 USING utf8mb4), CHAR(0xF09D958F USING utf8mb4)), LPAD(CONV(n, 10, 36), 8, '0')), n FROM (SELECT @i := @i + 1 AS n FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 1000) seq;
+ANALYZE TABLE pk_charset_test;
 
 > CREATE CLUSTER pk_charset_cluster SIZE 'scale=1,workers=4'
 
@@ -785,7 +828,9 @@ DROP TABLE pk_charset_test;
 
 #
 # Non-utf8mb4 charset PK: a latin1 column with a binary collation. Keys carry
-# high-byte latin1 characters (the 0xC0-0xDF range), built from their bytes.
+# high-byte latin1 characters (the 0xC0-0xDF range), built from their bytes. The
+# sampled-boundary split reads QUOTEd keys as UTF-8 and compares them back against
+# the latin1 column, so the charset round-trip must not drop or duplicate rows.
 #
 
 $ mysql-execute name=mysql
@@ -793,6 +838,7 @@ DROP TABLE IF EXISTS pk_latin1_test;
 CREATE TABLE pk_latin1_test (id VARCHAR(64) CHARACTER SET latin1 COLLATE latin1_bin PRIMARY KEY, val BIGINT);
 SET @i := 0;
 INSERT INTO pk_latin1_test SELECT CONCAT(CHAR(0xC0 + (n % 32) USING latin1), CONVERT(LPAD(CONV(n, 10, 36), 8, '0') USING latin1)), n FROM (SELECT @i := @i + 1 AS n FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 1000) seq;
+ANALYZE TABLE pk_latin1_test;
 
 > CREATE CLUSTER pk_latin1_cluster SIZE 'scale=1,workers=4'
 
@@ -817,8 +863,9 @@ DROP TABLE pk_latin1_test;
 
 #
 # Concurrent DML on a multibyte-keyed table. Inserts and deletes are issued right
-# after the source starts, so they race the snapshot. Whatever the interleaving,
-# the output must converge to the final upstream state exactly once per key.
+# after the source starts, so they race the parallel snapshot. Whatever the
+# interleaving, the rewind must converge the output to the final upstream state,
+# each key exactly once.
 #
 
 $ mysql-execute name=mysql
@@ -826,6 +873,7 @@ DROP TABLE IF EXISTS pk_conc_test;
 CREATE TABLE pk_conc_test (id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY, val BIGINT);
 SET @i := 0;
 INSERT INTO pk_conc_test SELECT CONCAT(ELT((n % 6) + 1, CHAR(0xC3B1 USING utf8mb4), CHAR(0xCEA9 USING utf8mb4), CHAR(0xE4B8AD USING utf8mb4), CHAR(0xE7958C USING utf8mb4), CHAR(0xF09F9880 USING utf8mb4), CHAR(0xF09D958F USING utf8mb4)), LPAD(CONV(n, 10, 36), 8, '0')), n FROM (SELECT @i := @i + 1 AS n FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT 1000) seq;
+ANALYZE TABLE pk_conc_test;
 
 > CREATE CLUSTER pk_conc_cluster SIZE 'scale=1,workers=4'
 

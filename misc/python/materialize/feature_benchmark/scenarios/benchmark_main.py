@@ -2061,8 +2061,14 @@ INSERT INTO pk_table SELECT @i:=@i+1, @i*@i FROM mysql.time_zone t1, mysql.time_
 
 
 class MySqlInitialLoadMultiWorkerSampled(MySqlCdc):
-    """Measure an 8-worker snapshot across 20 tables with a single-column
-    non-integer primary key (a CHAR(26) ULID-like key)."""
+    """Measure an 8-worker parallel snapshot across 20 tables with a single-column
+    non-integer primary key (a CHAR(26) ULID-like key).
+
+    The leader samples range boundaries from the primary-key index, splitting each
+    table's rows into disjoint ranges, one per worker. Each worker then reads,
+    decodes, and persists its own range in parallel, so the snapshot scales with
+    worker count instead of running on a single worker.
+    """
 
     RELATIVE_THRESHOLD: dict[MeasurementType, float] = {
         MeasurementType.WALLCLOCK: 0.10,
@@ -2074,8 +2080,9 @@ class MySqlInitialLoadMultiWorkerSampled(MySqlCdc):
     # (~3M rows), so a single INSERT per table suffices.
     MAX_SCALE = 6
 
-    # Number of tables to snapshot. Their row counts sum to n() (spread across the
-    # tables, not n() each) so total snapshot volume stays at n().
+    # Number of identical tables snapshotted in parallel. Their row counts sum to
+    # n() (spread across the tables, not n() each) so total snapshot volume stays
+    # at n() while still exercising the per-table parallel range split.
     TABLES = 20
 
     def rows_per_table(self) -> list[int]:
@@ -2087,6 +2094,7 @@ class MySqlInitialLoadMultiWorkerSampled(MySqlCdc):
         return counts
 
     def shared(self) -> Action:
+        # ANALYZE each table so the split's approximate row count reflects the load.
         row_values = "LPAD(CONV(@i := @i + 1, 10, 36), 26, '0'), @i"
         row_counts = self.rows_per_table()
         table_blocks = []
@@ -2096,7 +2104,8 @@ class MySqlInitialLoadMultiWorkerSampled(MySqlCdc):
                 f"CREATE TABLE {table} (pk CHAR(26) PRIMARY KEY, f2 BIGINT);\n"
                 f"SET @i := 0;\n"
                 f"INSERT INTO {table} SELECT {row_values} "
-                f"FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT {row_counts[i]};"
+                f"FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT {row_counts[i]};\n"
+                f"ANALYZE TABLE {table};"
             )
         load = "\n".join(table_blocks)
         return TdAction(f"""
@@ -2119,7 +2128,7 @@ USE public;
     def benchmark(self) -> MeasurementSource:
         # The first CREATE TABLE carries the /* A */ start marker and the last
         # count carries /* B */, so the measured window spans creating every
-        # subsource and hydrating all the tables' snapshots.
+        # subsource and hydrating all the tables' snapshots in parallel.
         creates = []
         for i in range(self.TABLES):
             table = f"pk_table{i + 1}"
@@ -2159,9 +2168,13 @@ USE public;
 
 
 class MySqlInitialLoadMultiWorkerSingleTable(MySqlCdc):
-    """Measure an 8-worker snapshot of a single table of n() rows with a
-    single-column non-integer primary key (a CHAR(26) ULID-like key). The
-    single-table companion to MySqlInitialLoadMultiWorkerSampled."""
+    """Measure an 8-worker parallel snapshot of a single table of n() rows with a
+    single-column non-integer primary key (a CHAR(26) ULID-like key).
+
+    The leader samples range boundaries from the primary-key index, splitting the
+    table's rows into disjoint ranges, one per worker, which read in parallel.
+    This is the single-table companion to MySqlInitialLoadMultiWorkerSampled.
+    """
 
     RELATIVE_THRESHOLD: dict[MeasurementType, float] = {
         MeasurementType.WALLCLOCK: 0.10,
@@ -2187,6 +2200,7 @@ USE public;
 CREATE TABLE pk_table (pk CHAR(26) PRIMARY KEY, f2 BIGINT);
 SET @i := 0;
 INSERT INTO pk_table SELECT LPAD(CONV(@i := @i + 1, 10, 36), 26, '0'), @i FROM mysql.time_zone t1, mysql.time_zone t2 LIMIT {self.n()};
+ANALYZE TABLE pk_table;
 """)
 
     def before(self) -> Action:
