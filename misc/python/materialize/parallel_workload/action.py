@@ -3568,7 +3568,9 @@ class HttpPostAction(Action):
 
             headers = {
                 header: (
-                    f"{datetime.datetime.now()}"
+                    # The webhook CHECK compares this against now(), which is UTC,
+                    # so a local timestamp fails validation on non-UTC hosts.
+                    f"{datetime.datetime.now(datetime.timezone.utc)}"
                     if header == "timestamp"
                     else f'"{Text.random_value(self.rng)}"'.encode()
                 )

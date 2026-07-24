@@ -449,7 +449,9 @@ class WebhookSource(DBObject):
             ]
             if "timestamp" in self.explicit_include_headers:
                 exprs.append(
-                    "(headers->'timestamp'::text)::timestamp + INTERVAL '10s' >= now()"
+                    # Generous tolerance, the delay between the client stamping the
+                    # header and the server validating it is unbounded under load.
+                    "(headers->'timestamp'::text)::timestamp + INTERVAL '5min' >= now()"
                 )
             self.check_expr = " AND ".join(
                 rng.sample(exprs, k=rng.randint(1, len(exprs)))
