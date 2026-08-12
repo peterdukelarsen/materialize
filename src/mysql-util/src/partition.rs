@@ -14,8 +14,17 @@ use crate::{KeyProber, MySqlError, QualifiedTableRef};
 
 /// Computes up to `num_workers - 1` partition boundaries that divide the primary key space
 /// into `num_workers` roughly even partitions.
-/// This should be run in a repeatable read transaction against a primary key varchar/char column
-/// with the `utf8mb4_bin` collation.
+///
+/// Nothing here validates the setup: the caller must abide by these
+/// constraints or undefined/untested behavior could occur, e.g. boundaries
+/// that fail to partition the key space or a walk that does not converge.
+/// * `pk_col` is the table's single-column primary key.
+/// * The column type is CHAR or VARCHAR with a declared length of at most
+///   [`crate::probe::MAX_KEY_LENGTH`] characters.
+/// * The column collation is `utf8mb4_bin`.
+/// * The connection is inside a REPEATABLE READ transaction, so the probes
+///   (several queries each) all see one snapshot of the table.
+///
 /// `min_split_threshold` is the smallest estimated row count granularity partitioning will
 /// target, which means if the algorithm processes a prefix estimated to cover less
 /// than min_split_threshold rows it won't bother splitting it up further. This is useful to
