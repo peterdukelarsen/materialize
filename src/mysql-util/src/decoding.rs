@@ -10,11 +10,12 @@
 use std::fmt::Write;
 use std::str::FromStr;
 
-use mysql_common::value::convert::from_value_opt;
+use mysql_common::value::convert::{FromValue, FromValueError, from_value_opt};
 use mysql_common::{Row as MySqlRow, Value};
 
 use mz_ore::cast::CastFrom;
 use mz_ore::error::ErrorExt;
+use mz_ore::str::redact;
 use mz_repr::adt::date::Date;
 use mz_repr::adt::jsonb::JsonbPacker;
 use mz_repr::adt::numeric::{NUMERIC_DATUM_MAX_PRECISION, Numeric, get_precision, get_scale};
@@ -143,6 +144,10 @@ pub fn pack_mysql_row(
 /// gtid_set (if any), and a shape description of `row` at the same time.
 /// The shape string is only built here — pack_mysql_row's happy path does no
 /// per-row allocation beyond what decoding requires.
+///
+/// `err_msg` is logged and persisted in the source's error collection, so it
+/// must never contain raw row values. Callers describe values via
+/// [`value_shape`] or mask them with [`redact`] instead.
 fn decode_error(
     err_msg: &str,
     col_desc: &MySqlColumnDesc,
@@ -164,6 +169,36 @@ fn decode_error(
         column_name: col_desc.name.clone(),
         qualified_table_name: format!("{}.{}", table_desc.schema_name, table_desc.name),
         error: err_msg.to_string(),
+    }
+}
+
+/// Convert a wire `Value` like [`from_value_opt`], but with the conversion
+/// error describing the value only by [`value_shape`]. `FromValueError`'s own
+/// message embeds the raw value, which must not reach error text (see
+/// [`decode_error`]).
+fn from_value_shaped<T: FromValue>(value: Value) -> Result<T, anyhow::Error> {
+    from_value_opt::<T>(value).map_err(|FromValueError(v)| {
+        anyhow::anyhow!(
+            "couldn't convert value {} to the expected type",
+            value_shape(&v)
+        )
+    })
+}
+
+/// A content-free description of a wire `Value` for error messages: the
+/// variant and, for bytes, the length. Error text built from this ends up in
+/// logs and the source's error collection, so it must never include the value
+/// itself.
+fn value_shape(value: &Value) -> String {
+    match value {
+        Value::NULL => "null".to_string(),
+        Value::Bytes(b) => format!("bytes(len={})", b.len()),
+        Value::Int(_) => "int".to_string(),
+        Value::UInt(_) => "uint".to_string(),
+        Value::Float(_) => "float".to_string(),
+        Value::Double(_) => "double".to_string(),
+        Value::Date(..) => "date".to_string(),
+        Value::Time(..) => "time".to_string(),
     }
 }
 
@@ -219,14 +254,7 @@ fn describe_row_shape(row: &MySqlRow, table_desc: &MySqlTableDesc) -> String {
 
         let val_desc = match row.as_ref(i) {
             None => "absent".to_string(),
-            Some(Value::NULL) => "null".to_string(),
-            Some(Value::Bytes(b)) => format!("bytes(len={})", b.len()),
-            Some(Value::Int(_)) => "int".to_string(),
-            Some(Value::UInt(_)) => "uint".to_string(),
-            Some(Value::Float(_)) => "float".to_string(),
-            Some(Value::Double(_)) => "double".to_string(),
-            Some(Value::Date(..)) => "date".to_string(),
-            Some(Value::Time(..)) => "time".to_string(),
+            Some(value) => value_shape(value),
         };
 
         let _ = write!(
@@ -260,14 +288,14 @@ fn pack_val_as_datum(
             }
         }
         value => match &column_type.scalar_type {
-            SqlScalarType::Bool => packer.push(Datum::from(from_value_opt::<bool>(value)?)),
-            SqlScalarType::UInt16 => packer.push(Datum::from(from_value_opt::<u16>(value)?)),
-            SqlScalarType::Int16 => packer.push(Datum::from(from_value_opt::<i16>(value)?)),
-            SqlScalarType::UInt32 => packer.push(Datum::from(from_value_opt::<u32>(value)?)),
-            SqlScalarType::Int32 => packer.push(Datum::from(from_value_opt::<i32>(value)?)),
+            SqlScalarType::Bool => packer.push(Datum::from(from_value_shaped::<bool>(value)?)),
+            SqlScalarType::UInt16 => packer.push(Datum::from(from_value_shaped::<u16>(value)?)),
+            SqlScalarType::Int16 => packer.push(Datum::from(from_value_shaped::<i16>(value)?)),
+            SqlScalarType::UInt32 => packer.push(Datum::from(from_value_shaped::<u32>(value)?)),
+            SqlScalarType::Int32 => packer.push(Datum::from(from_value_shaped::<i32>(value)?)),
             SqlScalarType::UInt64 => {
                 if let Some(MySqlColumnMeta::Bit(precision)) = &col_desc.meta {
-                    let mut value = from_value_opt::<Vec<u8>>(value)?;
+                    let mut value = from_value_shaped::<Vec<u8>>(value)?;
 
                     // Ensure we have the correct number of bytes.
                     let precision_bytes = (precision + 7) / 8;
@@ -291,19 +319,19 @@ fn pack_val_as_datum(
                     let value = u64::from_be_bytes(buf);
                     packer.push(Datum::from(value))
                 } else {
-                    packer.push(Datum::from(from_value_opt::<u64>(value)?))
+                    packer.push(Datum::from(from_value_shaped::<u64>(value)?))
                 }
             }
-            SqlScalarType::Int64 => packer.push(Datum::from(from_value_opt::<i64>(value)?)),
-            SqlScalarType::Float32 => packer.push(Datum::from(from_value_opt::<f32>(value)?)),
-            SqlScalarType::Float64 => packer.push(Datum::from(from_value_opt::<f64>(value)?)),
+            SqlScalarType::Int64 => packer.push(Datum::from(from_value_shaped::<i64>(value)?)),
+            SqlScalarType::Float32 => packer.push(Datum::from(from_value_shaped::<f32>(value)?)),
+            SqlScalarType::Float64 => packer.push(Datum::from(from_value_shaped::<f64>(value)?)),
             SqlScalarType::Char { length } => {
-                let val = from_value_opt::<String>(value)?;
+                let val = from_value_shaped::<String>(value)?;
                 check_char_length(length.map(|l| l.into_u32()), &val, col_desc)?;
                 packer.push(Datum::String(&val));
             }
             SqlScalarType::VarChar { max_length } => {
-                let val = from_value_opt::<String>(value)?;
+                let val = from_value_shaped::<String>(value)?;
                 check_char_length(max_length.map(|l| l.into_u32()), &val, col_desc)?;
                 packer.push(Datum::String(&val));
             }
@@ -331,8 +359,8 @@ fn pack_val_as_datum(
                                     // stream, so we need to find the string value from the enum meta
                                     let enum_val = e.values.get(enum_int - 1).ok_or_else(|| {
                                         anyhow::anyhow!(
-                                            "received invalid enum value: {} for column {}",
-                                            val,
+                                            "received invalid enum value: {:?} for column {}",
+                                            redact(&val),
                                             col_desc.name
                                         )
                                     })?;
@@ -341,8 +369,8 @@ fn pack_val_as_datum(
                                 }
                             }
                             _ => Err(anyhow::anyhow!(
-                                "received unexpected value for enum type: {:?}",
-                                value
+                                "received unexpected value for enum type: {}",
+                                value_shape(&value)
                             ))?,
                         }
                     }
@@ -355,13 +383,13 @@ fn pack_val_as_datum(
                             packer.push(Datum::String(&json.to_string()));
                         } else {
                             Err(anyhow::anyhow!(
-                                "received unexpected value for json type: {:?}",
-                                value
+                                "received unexpected value for json type: {}",
+                                value_shape(&value)
                             ))?;
                         }
                     }
                     Some(MySqlColumnMeta::Year) => {
-                        let mut val = from_value_opt::<u16>(value)?;
+                        let mut val = from_value_shaped::<u16>(value)?;
                         // mysql_common incorrectly handles MySQL YEAR type, which has a valid range
                         // of 1901-2155 (https://dev.mysql.com/doc/refman/8.0/en/year.html)
                         //
@@ -379,8 +407,8 @@ fn pack_val_as_datum(
                             packer.push(Datum::String(&format!("{:04}-{:02}-{:02}", y, m, d)));
                         } else {
                             Err(anyhow::anyhow!(
-                                "received unexpected value for date type: {:?}",
-                                value
+                                "received unexpected value for date type: {}",
+                                value_shape(&value)
                             ))?;
                         }
                     }
@@ -408,7 +436,10 @@ fn pack_val_as_datum(
                             Value::Int(0) => mysql_zero_timestamp(*precision),
                             Value::Int(val) => chrono::DateTime::from_timestamp(val, 0)
                                 .ok_or_else(|| {
-                                    anyhow::anyhow!("received invalid timestamp value: {}", val)
+                                    anyhow::anyhow!(
+                                        "received invalid timestamp value: {:?}",
+                                        redact(&val)
+                                    )
                                 })?
                                 .naive_utc()
                                 .format("%Y-%m-%d %H:%M:%S")
@@ -417,7 +448,10 @@ fn pack_val_as_datum(
                             // same canonical YYYY-MM-DD HH:MM:SS[.ffff] text.
                             Value::Bytes(data) => {
                                 let s = std::str::from_utf8(&data).map_err(|_| {
-                                    anyhow::anyhow!("received invalid timestamp value: {:?}", data)
+                                    anyhow::anyhow!(
+                                        "received invalid timestamp value: non-UTF-8 bytes(len={})",
+                                        data.len()
+                                    )
                                 })?;
                                 // sec=0 (with or without fractional component) is the
                                 // zero-date sentinel.
@@ -430,7 +464,10 @@ fn pack_val_as_datum(
                                         chrono::NaiveDateTime::parse_from_str(s, "%s")
                                     }
                                     .map_err(|_| {
-                                        anyhow::anyhow!("received invalid timestamp value: {:?}", s)
+                                        anyhow::anyhow!(
+                                            "received invalid timestamp value: {:?}",
+                                            redact(&s)
+                                        )
                                     })?;
                                     use chrono::{Datelike, Timelike};
                                     let y = u16::try_from(dt.year()).map_err(|_| {
@@ -452,15 +489,15 @@ fn pack_val_as_datum(
                                 }
                             }
                             _ => Err(anyhow::anyhow!(
-                                "received unexpected value for timestamp type: {:?}",
-                                value
+                                "received unexpected value for timestamp type: {}",
+                                value_shape(&value)
                             ))?,
                         };
                         packer.push(Datum::String(&str_timestamp));
                     }
                     Some(MySqlColumnMeta::Bit(_)) => unreachable!("parsed as a u64"),
                     None => {
-                        packer.push(Datum::String(&from_value_opt::<String>(value)?));
+                        packer.push(Datum::String(&from_value_shaped::<String>(value)?));
                     }
                 }
             }
@@ -473,9 +510,10 @@ fn pack_val_as_datum(
                     packer.pack_slice(&data).map_err(|e| {
                         anyhow::anyhow!(
                             "Failed to decode JSON: {}",
-                            // See if we can output the string that failed to be converted to JSON.
+                            // Output the string that failed to convert with its data
+                            // masked, keeping the structure visible for debugging.
                             match std::str::from_utf8(&data) {
-                                Ok(str) => str.to_string(),
+                                Ok(str) => format!("{:?}", redact(&str)),
                                 // Otherwise produce the nominally helpful error.
                                 Err(_) => e.display_with_causes().to_string(),
                             }
@@ -483,17 +521,17 @@ fn pack_val_as_datum(
                     })?;
                 } else {
                     Err(anyhow::anyhow!(
-                        "received unexpected value for json type: {:?}",
-                        value
+                        "received unexpected value for json type: {}",
+                        value_shape(&value)
                     ))?
                 }
             }
             SqlScalarType::Bytes => {
-                let data = from_value_opt::<Vec<u8>>(value)?;
+                let data = from_value_shaped::<Vec<u8>>(value)?;
                 packer.push(Datum::Bytes(&data));
             }
             SqlScalarType::Date => {
-                let date = Date::try_from(from_value_opt::<chrono::NaiveDate>(value)?)?;
+                let date = Date::try_from(from_value_shaped::<chrono::NaiveDate>(value)?)?;
                 packer.push(Datum::from(date));
             }
             SqlScalarType::Timestamp { precision: _ } => {
@@ -503,11 +541,11 @@ fn pack_val_as_datum(
                 // https://github.com/blackbeam/rust_mysql_common/blob/v0.35.5/src/binlog/value.rs#L87-L155
                 // https://github.com/blackbeam/rust_mysql_common/blob/v0.35.5/src/value/mod.rs#L332
                 let chrono_timestamp = match value {
-                    Value::Date(..) => from_value_opt::<chrono::NaiveDateTime>(value)?,
+                    Value::Date(..) => from_value_shaped::<chrono::NaiveDateTime>(value)?,
                     // old temporal format from before MySQL 5.6; didn't support fractional seconds
                     Value::Int(val) => chrono::DateTime::from_timestamp(val, 0)
                         .ok_or_else(|| {
-                            anyhow::anyhow!("received invalid timestamp value: {}", val)
+                            anyhow::anyhow!("received invalid timestamp value: {:?}", redact(&val))
                         })?
                         .naive_utc(),
                     Value::Bytes(data) => {
@@ -519,8 +557,8 @@ fn pack_val_as_datum(
                         }
                     }
                     _ => Err(anyhow::anyhow!(
-                        "received unexpected value for timestamp type: {:?}",
-                        value
+                        "received unexpected value for timestamp type: {}",
+                        value_shape(&value)
                     ))?,
                 };
                 packer.push(Datum::try_from(CheckedTimestamp::try_from(
@@ -528,14 +566,14 @@ fn pack_val_as_datum(
                 )?)?);
             }
             SqlScalarType::Time => {
-                packer.push(Datum::from(from_value_opt::<chrono::NaiveTime>(value)?));
+                packer.push(Datum::from(from_value_shaped::<chrono::NaiveTime>(value)?));
             }
             SqlScalarType::Numeric { max_scale } => {
                 // The wire-format of numeric types is a string when sent in a binary query
                 // response but is represented in a decimal binary format when sent in a binlog
                 // event. However the mysql-common crate abstracts this away and always returns
                 // a string. We parse the string into a numeric type here.
-                let val = from_value_opt::<String>(value)?;
+                let val = from_value_shaped::<String>(value)?;
                 let val = Numeric::from_str(&val)?;
                 if get_precision(&val) > NUMERIC_DATUM_MAX_PRECISION.into() {
                     Err(anyhow::anyhow!(
@@ -559,9 +597,9 @@ fn pack_val_as_datum(
             }
             // TODO(roshan): IMPLEMENT OTHER TYPES
             data_type => Err(anyhow::anyhow!(
-                "received unexpected value for type: {:?}: {:?}",
+                "received unexpected value for type: {:?}: {}",
                 data_type,
-                value
+                value_shape(&value)
             ))?,
         },
     }
@@ -780,5 +818,31 @@ mod tests {
             msg.contains("unexpected value for timestamp"),
             "unexpected error message: {msg}"
         );
+    }
+
+    /// Decode-error text is logged and persisted in the source's error
+    /// collection, so it must describe values only by shape, never content
+    /// (see `decode_error`). Guards the `from_value_shaped` wrapper against
+    /// regressing to `FromValueError`'s message, which embeds the raw value.
+    #[mz_ore::test]
+    fn conversion_errors_do_not_leak_values() {
+        let col = MySqlColumnDesc {
+            name: "n".to_string(),
+            column_type: Some(SqlColumnType {
+                scalar_type: SqlScalarType::Int32,
+                nullable: false,
+            }),
+            meta: None,
+        };
+        let mut row = Row::default();
+        let err = pack_val_as_datum(
+            Value::Bytes(b"super-secret-payload".to_vec()),
+            &col,
+            &mut row.packer(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("super-secret-payload"), "leaked value: {msg}");
+        assert!(msg.contains("bytes(len=20)"), "unexpected message: {msg}");
     }
 }
