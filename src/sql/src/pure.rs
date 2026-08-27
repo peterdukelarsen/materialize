@@ -1091,6 +1091,8 @@ async fn purify_create_source(
                 external_references,
                 &text_columns,
                 &exclude_columns,
+                &BTreeSet::new(),
+                false,
                 source_name,
                 timeout,
                 &reference_policy,
@@ -1681,6 +1683,8 @@ async fn purify_alter_source_add_subsources(
                 &requested_references,
                 &text_columns,
                 &exclude_columns,
+                &BTreeSet::new(),
+                false,
                 &unresolved_source_name,
                 timeout,
                 &SourceReferencePolicy::Required,
@@ -1923,7 +1927,9 @@ async fn purify_create_table_from_source(
     if (!exclude_constraints.is_empty() || exclude_all_constraints)
         && !matches!(
             desc.connection,
-            GenericSourceConnection::Postgres(_) | GenericSourceConnection::MySql(_)
+            GenericSourceConnection::Postgres(_)
+                | GenericSourceConnection::MySql(_)
+                | GenericSourceConnection::SqlServer(_)
         )
     {
         sql_bail!(
@@ -2057,6 +2063,8 @@ async fn purify_create_table_from_source(
                 &requested_references,
                 &qualified_text_columns,
                 &qualified_exclude_columns,
+                &exclude_constraints,
+                exclude_all_constraints,
                 &unresolved_source_name,
                 timeout,
                 &SourceReferencePolicy::Required,
