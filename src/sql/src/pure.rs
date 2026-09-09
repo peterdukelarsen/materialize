@@ -83,7 +83,7 @@ use crate::names::{
 };
 use crate::plan::error::PlanError;
 use crate::plan::statement::ddl::load_generator_ast_to_generator;
-use crate::plan::{SourceReferences, StatementContext};
+use crate::plan::{PlanNotice, SourceReferences, StatementContext};
 use crate::pure::error::{IcebergSinkPurificationError, SqlServerSourcePurificationError};
 use crate::pure::mysql::{ensure_binlog_full_metadata, is_binlog_full_metadata};
 use crate::{kafka_util, normalize};
@@ -237,6 +237,9 @@ pub enum PurifiedStatement {
     PurifiedCreateSink(CreateSinkStatement<Aug>),
     PurifiedCreateTableFromSource {
         stmt: CreateTableFromSourceStatement<Aug>,
+        /// Notices about options that only purification can judge, because
+        /// they depend on upstream metadata the statement does not retain.
+        notices: Vec<PlanNotice>,
     },
 }
 
@@ -265,6 +268,8 @@ pub enum PurifiedExportDetails {
         text_columns: Option<Vec<Ident>>,
         excl_columns: Option<Vec<Ident>>,
         capture_instance: Arc<str>,
+        /// The index the capture instance is bound to, if any.
+        capture_instance_index: Option<Arc<str>>,
         initial_lsn: mz_sql_server_util::cdc::Lsn,
     },
     Kafka {},
@@ -2134,6 +2139,25 @@ async fn purify_create_table_from_source(
     // external reference
     *external_reference = Some(purified_export.external_reference.clone());
 
+    // Excluding the index a capture instance is bound to buys no resilience:
+    // SQL Server refuses to drop that index while the capture instance
+    // exists. It is still allowed, since it controls the recorded keys, but
+    // worth saying. `EXCLUDE ALL CONSTRAINTS` is not called out because its
+    // point is usually nullability rather than that index.
+    let mut notices = vec![];
+    if let PurifiedExportDetails::SqlServer {
+        capture_instance,
+        capture_instance_index: Some(index),
+        ..
+    } = &purified_export.details
+        && exclude_constraints.contains(index.as_ref())
+    {
+        notices.push(PlanNotice::SqlServerCaptureIndexExcluded {
+            constraint: index.to_string(),
+            capture_instance: capture_instance.to_string(),
+        });
+    }
+
     // Update options in the statement using the purified export details
     match &purified_export.details {
         PurifiedExportDetails::Postgres { .. } => {
@@ -2349,7 +2373,7 @@ async fn purify_create_table_from_source(
     // TODO: We might as well use the retrieved available references to update the source
     // available references table in the catalog, so plumb this through.
     // available_source_references: retrieved_source_references.available_source_references(),
-    Ok(PurifiedStatement::PurifiedCreateTableFromSource { stmt })
+    Ok(PurifiedStatement::PurifiedCreateTableFromSource { stmt, notices })
 }
 
 enum SourceFormatOptions {

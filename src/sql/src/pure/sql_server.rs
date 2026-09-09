@@ -217,6 +217,17 @@ pub(super) async fn purify_source_exports(
             (table.qualified_name(), Arc::clone(capture_instance))
         })
         .collect();
+    let capture_instance_indexes: BTreeMap<_, _> = requested_exports
+        .iter()
+        .map(|requested| {
+            let table = requested
+                .meta
+                .sql_server_table()
+                .expect("sql server source");
+            let index = requested.meta.sql_server_capture_instance_index().cloned();
+            (table.qualified_name(), index)
+        })
+        .collect();
 
     mz_sql_server_util::inspect::validate_source_privileges(
         client,
@@ -348,6 +359,10 @@ pub(super) async fn purify_source_exports(
             let export = PurifiedSourceExport {
                 external_reference: reference.external_reference,
                 details: PurifiedExportDetails::SqlServer {
+                    capture_instance_index: capture_instance_indexes
+                        .get(&reference.meta.qualified_name())
+                        .cloned()
+                        .flatten(),
                     table: reference.meta,
                     text_columns,
                     excl_columns,
@@ -443,6 +458,7 @@ pub(super) fn generate_source_export_statement_values(
         text_columns,
         excl_columns,
         capture_instance,
+        capture_instance_index: _,
         initial_lsn,
     } = purified_export.details
     else {

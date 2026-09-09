@@ -403,6 +403,10 @@ pub struct SqlServerCaptureInstanceRaw {
     pub name: Arc<str>,
     /// The creation date of the capture instance.
     pub create_date: Arc<NaiveDateTime>,
+    /// The unique index the capture instance is bound to, if any. SQL Server
+    /// refuses to drop or disable this index while the capture instance
+    /// exists.
+    pub index_name: Option<Arc<str>>,
 }
 
 /// Description of a column from a table in Microsoft SQL Server.
@@ -1489,6 +1493,7 @@ mod tests {
                 )
                 .unwrap()
                 .into(),
+                index_name: None,
             }),
             columns: sql_server_columns.into(),
         };
@@ -1628,6 +1633,7 @@ mod tests {
                     )
                     .unwrap()
                     .into(),
+                    index_name: None,
                 }),
                 columns: columns.into(),
             };

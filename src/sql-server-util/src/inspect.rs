@@ -375,6 +375,7 @@ SELECT
     t.name as table_name,
     ch.capture_instance as capture_instance,
     ch.create_date as capture_instance_create_date,
+    ch.index_name as capture_instance_index_name,
     c.name as col_name,
     ty.name as col_type,
     c.is_nullable as col_nullable,
@@ -442,6 +443,7 @@ SELECT
     t.name as table_name,
     ch.capture_instance as capture_instance,
     ch.create_date as capture_instance_create_date,
+    ch.index_name as capture_instance_index_name,
     c.name as col_name,
     ty.name as col_type,
     c.is_nullable as col_nullable,
@@ -904,6 +906,9 @@ fn deserialize_table_columns_to_raw_tables(
         let capture_instance: Arc<str> = get_value::<&str>(row, "capture_instance")?.into();
         let capture_instance_create_date: NaiveDateTime =
             get_value::<NaiveDateTime>(row, "capture_instance_create_date")?;
+        let capture_instance_index_name: Option<Arc<str>> = row
+            .try_get::<&str, _>("capture_instance_index_name")?
+            .map(Into::into);
 
         let columns: &mut Vec<_> = tables
             .entry((
@@ -911,6 +916,7 @@ fn deserialize_table_columns_to_raw_tables(
                 Arc::clone(&table_name),
                 Arc::clone(&capture_instance),
                 capture_instance_create_date,
+                capture_instance_index_name,
             ))
             .or_default();
         // A NULL column comes from an outer join in the query: the table is
@@ -932,13 +938,17 @@ fn deserialize_table_columns_to_raw_tables(
     let raw_tables = tables
         .into_iter()
         .map(
-            |((schema, name, capture_instance, capture_instance_create_date), columns)| {
+            |(
+                (schema, name, capture_instance, capture_instance_create_date, index_name),
+                columns,
+            )| {
                 SqlServerTableRaw {
                     schema_name: schema,
                     name,
                     capture_instance: Arc::new(SqlServerCaptureInstanceRaw {
                         name: capture_instance,
                         create_date: capture_instance_create_date.into(),
+                        index_name,
                     }),
                     columns: columns.into(),
                 }

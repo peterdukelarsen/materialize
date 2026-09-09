@@ -64,6 +64,7 @@ pub(super) enum ReferenceMetadata {
         table: mz_sql_server_util::desc::SqlServerTableDesc,
         database: Arc<str>,
         capture_instance: Arc<str>,
+        capture_instance_index: Option<Arc<str>>,
     },
     Kafka(String),
     LoadGenerator {
@@ -125,6 +126,17 @@ impl ReferenceMetadata {
         }
     }
 
+    /// The index the SQL Server capture instance is bound to, if any.
+    pub(super) fn sql_server_capture_instance_index(&self) -> Option<&Arc<str>> {
+        match self {
+            ReferenceMetadata::SqlServer {
+                capture_instance_index,
+                ..
+            } => capture_instance_index.as_ref(),
+            _ => None,
+        }
+    }
+
     pub(super) fn load_generator_desc(&self) -> Option<&Option<RelationDesc>> {
         match self {
             ReferenceMetadata::LoadGenerator { desc, .. } => Some(desc),
@@ -159,6 +171,7 @@ impl ReferenceMetadata {
                 table,
                 database,
                 capture_instance: _,
+                capture_instance_index: _,
             } => Ok(UnresolvedItemName::qualified(&[
                 Ident::new(database.as_ref())?,
                 Ident::new(table.schema_name.as_ref())?,
@@ -292,6 +305,7 @@ impl<'a> SourceReferenceClient<'a> {
                             .remove(&qualified_table_name)
                             .unwrap_or_default();
                         let capture_instance = Arc::clone(&raw_table.capture_instance.name);
+                        let capture_instance_index = raw_table.capture_instance.index_name.clone();
                         let database = Arc::clone(database);
                         let table = mz_sql_server_util::desc::SqlServerTableDesc::new(
                             raw_table,
@@ -301,6 +315,7 @@ impl<'a> SourceReferenceClient<'a> {
                             table,
                             database,
                             capture_instance,
+                            capture_instance_index,
                         })
                     })
                     .collect::<Result<_, SqlServerError>>()?

@@ -42,6 +42,10 @@ pub enum PlanNotice {
         name: String,
     },
     ReplicaDiskOptionDeprecated,
+    SqlServerCaptureIndexExcluded {
+        constraint: String,
+        capture_instance: String,
+    },
 }
 
 impl PlanNotice {
@@ -59,6 +63,13 @@ impl PlanNotice {
                 );
                 Some(details)
             }
+            PlanNotice::SqlServerCaptureIndexExcluded { .. } => Some(
+                "SQL Server refuses to drop or disable the index a capture instance is bound to \
+                 while change data capture is enabled on the table, so this exclusion cannot \
+                 make an upstream drop a non-event. It only removes the key from the table in \
+                 Materialize."
+                    .into(),
+            ),
             _ => None,
         }
     }
@@ -101,6 +112,17 @@ impl fmt::Display for PlanNotice {
             }
             PlanNotice::ReplicaDiskOptionDeprecated => {
                 write!(f, "the DISK option is deprecated and has no effect")
+            }
+            PlanNotice::SqlServerCaptureIndexExcluded {
+                constraint,
+                capture_instance,
+            } => {
+                write!(
+                    f,
+                    "constraint {} is the index bound to SQL Server capture instance {}",
+                    constraint.quoted(),
+                    capture_instance.quoted()
+                )
             }
         }
     }

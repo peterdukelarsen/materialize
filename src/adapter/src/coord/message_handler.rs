@@ -887,7 +887,9 @@ impl Coordinator {
                     PurifiedStatement::PurifiedAlterSource { alter_source_stmt } => {
                         Statement::AlterSource(alter_source_stmt)
                     }
-                    PurifiedStatement::PurifiedCreateTableFromSource { stmt } => {
+                    PurifiedStatement::PurifiedCreateTableFromSource { stmt, notices } => {
+                        ctx.session()
+                            .add_notices(notices.into_iter().map(AdapterNotice::PlanNotice));
                         Statement::CreateTableFromSource(stmt)
                     }
                     PurifiedStatement::PurifiedCreateSink(stmt) => Statement::CreateSink(stmt),

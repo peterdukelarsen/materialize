@@ -74,6 +74,22 @@ contains:EXCLUDE ALL CONSTRAINTS cannot be combined with EXCLUDE CONSTRAINTS
 true
 
 #
+# Excluding the PRIMARY KEY is allowed, but SQL Server refuses to drop the
+# index a capture instance is bound to, so CREATE TABLE raises a NOTICE that
+# the exclusion cannot make an upstream drop a non-event. Only the effect on
+# the recorded keys is observable here.
+#
+
+> CREATE TABLE t27_pk_excluded FROM SOURCE t27_source (REFERENCE t27_uniq)
+  WITH (EXCLUDE CONSTRAINTS ('t27_pk'));
+
+> CREATE DEFAULT INDEX ON t27_pk_excluded;
+> SELECT key FROM (SHOW INDEXES ON t27_pk_excluded);
+{wallet}
+
+> DROP TABLE t27_pk_excluded;
+
+#
 # EXCLUDE ALL CONSTRAINTS: no keys, every column nullable.
 #
 
