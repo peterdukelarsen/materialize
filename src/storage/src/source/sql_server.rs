@@ -100,16 +100,19 @@ pub enum DefiniteError {
     ProgrammingError(String),
     #[error("Restore history id changed from {0:?} to {1:?}")]
     RestoreHistoryChanged(Option<i32>, Option<i32>),
-    #[error("Incompatible schema change for table {0} capture instance {1}")]
-    IncompatibleSchemaChange(String, String),
+    #[error("table {table} is no longer captured by capture instance {capture_instance}")]
+    TableNotCaptured {
+        capture_instance: String,
+        table: String,
+    },
     #[error(transparent)]
-    IncompatibleConstraintChange(#[from] SchemaChangeError),
+    IncompatibleSchema(#[from] SchemaChangeError),
 }
 
 impl DefiniteError {
     fn hint(&self) -> Option<String> {
         match self {
-            DefiniteError::IncompatibleConstraintChange(err) => Some(err.hint()),
+            DefiniteError::IncompatibleSchema(err) => err.hint(),
             _ => None,
         }
     }

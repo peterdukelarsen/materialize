@@ -128,7 +128,7 @@ ALTER TABLE remove_column DROP COLUMN f2;
 INSERT INTO remove_column VALUES (3);
 
 ! SELECT * from remove_column;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.remove_column: column "f2" was dropped, renamed, or recreated upstream
 
 
 #
@@ -142,7 +142,7 @@ ALTER TABLE alter_column ALTER COLUMN f2 CHAR(2);
 INSERT INTO alter_column VALUES (3, 'cd');
 
 ! SELECT * from alter_column;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.alter_column: the type of column "f2" changed upstream
 
 #
 # Drop NOT NULL
@@ -154,7 +154,7 @@ $ sql-server-execute name=sql-server
 ALTER TABLE alter_drop_nullability ALTER COLUMN f1 INTEGER NULL;
 
 ! SELECT * FROM alter_drop_nullability WHERE f1 IS NOT NULL;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.alter_drop_nullability: the NOT NULL constraint on column "f1" was dropped upstream
 
 # We have guaranteed that this column is not null so the optimizer eagerly
 # returns the empty set.
@@ -171,8 +171,10 @@ $ sql-server-execute name=sql-server
 ALTER TABLE alter_add_nullability ALTER COLUMN f1 INTEGER NOT NULL;
 INSERT INTO alter_add_nullability VALUES (1);
 
-! SELECT * FROM alter_add_nullability;
-contains:Incompatible schema change
+# Adding a NOT NULL constraint upstream only narrows the data and is not a change.
+> SELECT * FROM alter_add_nullability;
+1
+1
 
 #
 # Add PK
@@ -229,7 +231,7 @@ ALTER TABLE alter_extend_column ALTER COLUMN f1 VARCHAR(20);
 
 
 ! SELECT * FROM alter_extend_column;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.alter_extend_column: the type of column "f1" changed upstream
 
 
 #
@@ -241,7 +243,7 @@ $ sql-server-execute name=sql-server
 ALTER TABLE alter_decimal ALTER COLUMN f1 DECIMAL(6,1);
 
 ! SELECT * FROM alter_decimal;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.alter_decimal: the type of column "f1" changed upstream
 
 
 #
@@ -269,7 +271,7 @@ ALTER TABLE alter_table_change_attnum DROP COLUMN f2;
 ALTER TABLE alter_table_change_attnum ADD f2 VARCHAR(10);
 
 ! SELECT * FROM alter_table_change_attnum;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.alter_table_change_attnum: column "f2" was dropped, renamed, or recreated upstream
 
 > SELECT * from alter_table_supported;
 1 1
@@ -295,7 +297,7 @@ $ sql-server-execute name=sql-server
 ALTER TABLE alter_table_supported DROP COLUMN f2;
 
 ! SELECT * from alter_table_supported;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.alter_table_supported: column "f2" was dropped, renamed, or recreated upstream
 
 #
 # Drop table
@@ -306,11 +308,11 @@ contains:Incompatible schema change
 $ sql-server-execute name=sql-server
 DROP TABLE drop_table;
 
-# Table is dropped, but detected as a transient error with a poor error message, we should improve
-# this test once database-issues#9703 is fixed.
+# The CDC stream fails on the missing change table, and schema validation
+# reports the capture instance as gone. Whichever lands first stalls the table.
 > SELECT
     status,
-    error like '%Invalid object name%' as invalid_object_error
+    error like '%Invalid object name%' or error like '%no longer captured by capture instance%' as expected_error
   FROM mz_internal.mz_source_statuses
   WHERE name = 'drop_table';
 stalled true

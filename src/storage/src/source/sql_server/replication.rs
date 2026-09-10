@@ -18,7 +18,6 @@ use differential_dataflow::AsCollection;
 use futures::StreamExt;
 use itertools::Itertools;
 use mz_ore::cast::CastFrom;
-use mz_ore::collections::HashMap;
 use mz_ore::future::InTask;
 use mz_repr::{Diff, GlobalId, Row, RowArena};
 use mz_sql_server_util::SqlServerCdcMetrics;
@@ -106,9 +105,6 @@ pub(crate) fn render<'scope>(
             let mut capture_instances: BTreeMap<Arc<str>, Vec<_>> = BTreeMap::new();
             // Export statistics for a given capture instance
             let mut export_statistics: BTreeMap<_, Vec<_>> = BTreeMap::new();
-            // Maps the included columns for each output index so we can check
-            // whether schema updates are valid on a per-output basis
-            let mut included_columns: HashMap<u64, Vec<Arc<str>>> = HashMap::new();
 
             for (export_id, output) in outputs.iter() {
                 let key = output.partition_index;
@@ -116,14 +112,6 @@ pub(crate) fn render<'scope>(
                     panic!("Multiple decoders for output index {}", output.partition_index);
                 }
                 upstream_descs.insert(key, Arc::clone(&output.upstream_desc));
-                // Collect the included columns from decoder for schema
-                // change validation. The decoder serves as an effective
-                // source of truth for which columns are "included", as we
-                // only care about the columns that are being decoded and
-                // replicated
-                let included_cols = output.decoder.included_column_names();
-                included_columns.insert(output.partition_index, included_cols);
-
                 capture_instances
                     .entry(Arc::clone(&output.capture_instance))
                     .or_default()
@@ -233,6 +221,11 @@ pub(crate) fn render<'scope>(
                 }
             }
             let cdc_metrics = PrometheusSqlServerCdcMetrics{inner: &metrics};
+            // Upstream schema changes are found by comparing the table
+            // definitions the stream re-reads on every active poll against the
+            // descriptions the exports were created with. SQL Server never
+            // records constraint DDL in `cdc.ddl_history`, so that re-read is
+            // what catches a dropped key.
             let mut cdc_handle = client
                 .cdc(capture_instances.keys().cloned(), cdc_metrics)
                 .max_lsn_wait(MAX_LSN_WAIT.get(config.config.config_set()));
@@ -553,9 +546,8 @@ pub(crate) fn render<'scope>(
                             let desc = upstream_descs
                                 .get(partition_idx)
                                 .expect("description for output");
-                            if let Err(error) = desc.check_constraint_compatibility(&current) {
-                                let error =
-                                    DefiniteError::IncompatibleConstraintChange(error);
+                            if let Err(error) = desc.determine_compatibility(&current) {
+                                let error = DefiniteError::IncompatibleSchema(error);
                                 let update = (
                                     (*partition_idx, Err(error.into())),
                                     *data_cap_set[0].time(),
@@ -574,61 +566,43 @@ pub(crate) fn render<'scope>(
                         table,
                         ddl_event,
                     } => {
+                        // The stream re-reads the schema on every active poll,
+                        // so there is nothing to decide here.
+                        tracing::debug!(
+                            %config.id,
+                            %capture_instance,
+                            table = %table.to_string(),
+                            ddl = %ddl_event.ddl_command,
+                            "upstream DDL observed",
+                        );
+                    }
+                    CdcEvent::TableNotCaptured { capture_instance } => {
                         let Some(partition_indexes) =
                             capture_instances.get(&capture_instance)
                         else {
-                            let definite_error =
-                                DefiniteError::ProgrammingError(format!(
-                                    "capture instance didn't exist: \
-                                     '{capture_instance}'"
-                                ));
-                            return_definite_error(
-                                definite_error,
-                                capture_instances
-                                    .values()
-                                    .flat_map(|indexes| {
-                                        indexes.iter().copied()
-                                    }),
-                                data_output,
-                                data_cap_set,
-                                definite_error_handle,
-                                definite_error_cap_set,
-                            )
-                            .await;
-                            return Ok(());
+                            continue;
                         };
-                        let error =
-                            DefiniteError::IncompatibleSchemaChange(
-                                capture_instance.to_string(),
-                                table.to_string(),
-                            );
                         for partition_idx in partition_indexes {
-                            let cols = included_columns
-                                .get(partition_idx)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Partition index didn't \
-                                         exist: '{partition_idx}'"
-                                    )
-                                });
-                            if !errored_partitions
-                                .contains(partition_idx)
-                                && !ddl_event.is_compatible(cols)
-                            {
-                                let msg = Err(
-                                    error.clone().into(),
-                                );
-                                let update = (
-                                    (*partition_idx, msg),
-                                    ddl_event.lsn,
-                                    Diff::ONE,
-                                );
-                                let size = update.fuel_size();
-                                data_output
-                                    .give_fueled(&data_cap_set[0], update, size)
-                                    .await;
-                                errored_partitions.insert(*partition_idx);
+                            if errored_partitions.contains(partition_idx) {
+                                continue;
                             }
+                            let desc = upstream_descs
+                                .get(partition_idx)
+                                .expect("description for output");
+                            let error = DefiniteError::TableNotCaptured {
+                                capture_instance: capture_instance.to_string(),
+                                table: desc.qualified_name().to_string(),
+                            };
+                            let update = (
+                                (*partition_idx, Err(error.into())),
+                                *data_cap_set[0].time(),
+                                Diff::ONE,
+                            );
+                            let size = update.fuel_size();
+                            data_output
+                                .give_fueled(&data_cap_set[0], update, size)
+                                .await;
+                            errored_partitions.insert(*partition_idx);
                         }
                     }
                 };

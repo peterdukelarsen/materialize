@@ -428,6 +428,70 @@ pub async fn get_tables_for_capture_instance(
     Ok(tables)
 }
 
+// Like `GET_COLUMNS_FOR_TABLES_WITH_CDC_QUERY`, restricted to the columns a
+// capture instance still captures. `cdc.captured_columns` names a source
+// column by `column_id`, so a column that was dropped and added back under the
+// same name does not match: the change table keeps its old column and receives
+// NULL for it from then on. Columns added after the capture instance was
+// created are not captured and do not match either. The column joins are outer
+// so a capture instance none of whose columns still match is returned with no
+// columns, rather than disappearing as if it had been disabled.
+static GET_CAPTURED_COLUMNS_QUERY: &str = "
+SELECT
+    s.name as schema_name,
+    t.name as table_name,
+    ch.capture_instance as capture_instance,
+    ch.create_date as capture_instance_create_date,
+    c.name as col_name,
+    ty.name as col_type,
+    c.is_nullable as col_nullable,
+    c.max_length as col_max_length,
+    c.precision as col_precision,
+    c.scale as col_scale,
+    c.is_computed as col_is_computed
+FROM cdc.change_tables ch
+JOIN sys.tables t ON t.object_id = ch.source_object_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+LEFT JOIN cdc.captured_columns cc ON cc.object_id = ch.object_id
+LEFT JOIN sys.columns c
+    ON c.object_id = t.object_id
+    AND c.column_id = cc.column_id
+    AND c.name = cc.column_name
+LEFT JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+";
+
+/// Returns the current definition of the source table behind each of the given
+/// capture instances, restricted to the columns that instance still captures.
+///
+/// A capture instance whose table was dropped, or that was disabled, is absent
+/// from the result. One none of whose captured columns still exist is present
+/// with no columns.
+pub async fn get_captured_tables(
+    client: &mut Client,
+    capture_instances: impl IntoIterator<Item = &str>,
+) -> Result<Vec<SqlServerTableRaw>, SqlServerError> {
+    let params: SmallVec<[_; 1]> = capture_instances.into_iter().collect();
+    if params.is_empty() {
+        return Ok(Vec::default());
+    }
+    #[allow(clippy::as_conversions)]
+    let params_dyn: SmallVec<[_; 1]> = params
+        .iter()
+        .map(|instance| instance as &dyn tiberius::ToSql)
+        .collect();
+    let param_indexes = params
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| format!("@P{}", idx + 1))
+        .join(", ");
+    let query = format!(
+        "{GET_CAPTURED_COLUMNS_QUERY} WHERE ch.capture_instance IN ({param_indexes}) \
+         ORDER BY ch.capture_instance, c.column_id;"
+    );
+    let result = client.query(&query, &params_dyn[..]).await?;
+    deserialize_table_columns_to_raw_tables(&result)
+}
+
 /// Retrieves column metdata from the CDC table maintained by the provided capture instance. The
 /// resulting column information collection is similar to the information collected for the
 /// upstream table, with the exclusion of nullability and primary key constraints, which contain
@@ -617,84 +681,6 @@ pub async fn get_latest_restore_history_id(
 pub struct DDLEvent {
     pub lsn: Lsn,
     pub ddl_command: Arc<str>,
-}
-
-impl DDLEvent {
-    /// Returns true if the DDL event is a compatible change, or false if it is not.
-    /// This performs a naive parsing of the DDL command looking for modification of columns
-    ///  1. ALTER TABLE .. ALTER COLUMN
-    ///  2. ALTER TABLE .. DROP COLUMN
-    ///
-    /// See <https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-table-transact-sql?view=sql-server-ver17>
-    pub fn is_compatible(&self, included_columns: &[Arc<str>]) -> bool {
-        // TODO (maz): This is currently a basic check that doesn't take into account type changes.
-        // At some point, we will need to move this to SqlServerTableDesc and expand it.
-        let mut words = self.ddl_command.split_ascii_whitespace();
-        match (
-            words.next().map(str::to_ascii_lowercase).as_deref(),
-            words.next().map(str::to_ascii_lowercase).as_deref(),
-        ) {
-            (Some("alter"), Some("table")) => {
-                let mut peekable = words.peekable();
-                let mut compatible = true;
-                while compatible && let Some(token) = peekable.next() {
-                    compatible = match token.to_ascii_lowercase().as_str() {
-                        "alter" | "drop" => {
-                            let target = peekable.next();
-                            match target {
-                                // Targeting a column
-                                Some(t) if t.eq_ignore_ascii_case("column") => {
-                                    let mut all_excluded = true;
-                                    while let Some(tok) = peekable.next() {
-                                        // The column name(s) can be preceeded by the pair of keywords "IF EXISTS", so we want to skip those.
-                                        match tok.to_ascii_lowercase().as_str() {
-                                            "if" | "exists" | "," | "column" => continue,
-                                            col_str => {
-                                                // If any column is in the included list, then it is not okay to alter/drop it
-                                                // The col_str token may be a comma-separated list of columns as whitespace is not required
-                                                // between column names in SQL Server DDL.
-                                                if !col_str.trim_matches(',').split(',').all(
-                                                    |col_name| {
-                                                        !included_columns.iter().any(|included| {
-                                                            included.eq_ignore_ascii_case(
-                                                                col_name.trim_matches(
-                                                                    ['[', ']', '"'].as_ref(),
-                                                                ),
-                                                            )
-                                                        })
-                                                    },
-                                                ) {
-                                                    all_excluded = false;
-                                                    break;
-                                                }
-                                                // If this is the only/last column, then we can break out of the while loop.
-                                                // Check if this string has no trailing comma, and if not, peek to see if the next token
-                                                // contains a leading comma.
-                                                if !col_str.ends_with(",") {
-                                                    match peekable.peek() {
-                                                        Some(x) if x.starts_with(",") => continue,
-                                                        _ => break,
-                                                    }
-                                                }
-                                            }
-                                        };
-                                    }
-                                    all_excluded
-                                }
-                                // No target token after "alter" or "drop"
-                                None => false,
-                                // Other targets are considered compatible
-                                _ => true,
-                            }
-                        }
-                        _ => true,
-                    }
-                }
-                compatible
-            }
-            _ => true,
-        }
-    }
 }
 
 /// Returns DDL changes made to the source table for the given capture instance.  This follows the
@@ -919,17 +905,6 @@ fn deserialize_table_columns_to_raw_tables(
         let capture_instance_create_date: NaiveDateTime =
             get_value::<NaiveDateTime>(row, "capture_instance_create_date")?;
 
-        let column_name = get_value::<&str>(row, "col_name")?.into();
-        let column = SqlServerColumnRaw {
-            name: Arc::clone(&column_name),
-            data_type: get_value::<&str>(row, "col_type")?.into(),
-            is_nullable: get_value(row, "col_nullable")?,
-            max_length: get_value(row, "col_max_length")?,
-            precision: get_value(row, "col_precision")?,
-            scale: get_value(row, "col_scale")?,
-            is_computed: get_value(row, "col_is_computed")?,
-        };
-
         let columns: &mut Vec<_> = tables
             .entry((
                 Arc::clone(&schema_name),
@@ -938,7 +913,20 @@ fn deserialize_table_columns_to_raw_tables(
                 capture_instance_create_date,
             ))
             .or_default();
-        columns.push(column);
+        // A NULL column comes from an outer join in the query: the table is
+        // present but this row carries no column.
+        let Some(column_name) = row.try_get::<&str, _>("col_name")? else {
+            continue;
+        };
+        columns.push(SqlServerColumnRaw {
+            name: column_name.into(),
+            data_type: get_value::<&str>(row, "col_type")?.into(),
+            is_nullable: get_value(row, "col_nullable")?,
+            max_length: get_value(row, "col_max_length")?,
+            precision: get_value(row, "col_precision")?,
+            scale: get_value(row, "col_scale")?,
+            is_computed: get_value(row, "col_is_computed")?,
+        });
     }
 
     let raw_tables = tables
@@ -1126,8 +1114,7 @@ pub async fn validate_source_privileges(
 
 #[cfg(test)]
 mod tests {
-    use super::{DDLEvent, EngineEdition};
-    use std::sync::Arc;
+    use super::EngineEdition;
 
     #[mz_ore::test]
     fn test_engine_edition_mapping() {
@@ -1152,114 +1139,5 @@ mod tests {
             assert!(edition.has_sql_server_agent());
             assert!(edition.has_restore_history());
         }
-    }
-
-    #[mz_ore::test]
-    fn test_ddl_event_is_compatible() {
-        fn test_case(ddl_command: &str, included_columns: &[Arc<str>], expected: bool) {
-            let ddl_event = DDLEvent {
-                lsn: Default::default(),
-                ddl_command: ddl_command.into(),
-            };
-            let result = ddl_event.is_compatible(included_columns);
-            assert_eq!(
-                result, expected,
-                "DDL command '{}' with included_columns {:?} expected to be {}, got {}",
-                ddl_command, included_columns, expected, result
-            );
-        }
-
-        let included_columns = vec![Arc::from("col3"), Arc::from("col4"), Arc::from("col4")];
-
-        test_case(
-            "ALTER TABLE my_table ALTER COLUMN col1 INT",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col2",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table ALTER COLUMN col3 INT",
-            &included_columns,
-            false,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col4 INT",
-            &included_columns,
-            false,
-        );
-        test_case(
-            "CREATE INDEX idx_my_index ON my_table(col1)",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "DROP INDEX idx_my_index ON my_table",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table ADD COLUMN col5 INT",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1, col2",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col3, col2",
-            &included_columns,
-            false,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col3, col4",
-            &included_columns,
-            false,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN IF EXISTS col1, col2",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP CONSTRAINT constraint_name",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1,col3",
-            &included_columns,
-            false,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1,col2",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1 ,col2",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1 , col2",
-            &included_columns,
-            true,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1 , col3",
-            &included_columns,
-            false,
-        );
-        test_case(
-            "ALTER TABLE my_table DROP COLUMN col1 , COLUMN col3",
-            &included_columns,
-            false,
-        );
     }
 }

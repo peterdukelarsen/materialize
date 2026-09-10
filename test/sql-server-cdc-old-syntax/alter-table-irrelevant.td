@@ -112,7 +112,7 @@ ALTER TABLE irrelevant_table DROP COLUMN f2;
 INSERT INTO irrelevant_table VALUES ('gh');
 
 ! SELECT * FROM irrelevant_table
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.irrelevant_table: column "f2" was dropped, renamed, or recreated upstream
 
 > SELECT * FROM base_table;
 1

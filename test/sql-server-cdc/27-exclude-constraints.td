@@ -11,8 +11,7 @@
 # EXCLUDE CONSTRAINTS / EXCLUDE ALL CONSTRAINTS: excluded upstream constraints
 # are not recorded as Materialize keys, and dropping them upstream is not a
 # schema change. NOTE: SQL Server refuses to drop the index bound to a capture
-# instance, so a PRIMARY KEY drop cannot be exercised here, and upstream ALTER
-# COLUMN still errors the table regardless of these options.
+# instance, so a PRIMARY KEY drop cannot be exercised here.
 #
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
@@ -107,21 +106,29 @@ INSERT INTO t27_all VALUES (2, 'd@e.f');
 2 d@e.f
 
 #
-# Dropping an excluded constraint upstream is a non-event: no key was recorded,
-# so the data stays valid and the table keeps running.
+# Dropping an excluded constraint upstream is a non-event: no key or NOT NULL
+# was recorded, so the data stays valid and the tables keep running.
 #
 
 $ sql-server-execute name=sql-server
 ALTER TABLE t27_uniq DROP CONSTRAINT t27_uq_wallet;
 INSERT INTO t27_uniq VALUES (4, 'c');
+ALTER TABLE t27_all ALTER COLUMN email VARCHAR(64) NULL;
+INSERT INTO t27_all VALUES (3, NULL);
 
 > SELECT wallet, count(*) FROM t27_uniq GROUP BY wallet;
 a 1
 b 1
 c 2
 
-> SELECT status FROM mz_internal.mz_source_statuses WHERE name = 't27_uniq';
-running
+> SELECT * FROM t27_all;
+1 a@b.c
+2 d@e.f
+3 <null>
+
+> SELECT name, status FROM mz_internal.mz_source_statuses WHERE name IN ('t27_uniq', 't27_all');
+t27_uniq running
+t27_all running
 
 #
 # An empty exclusion list behaves as if the option were omitted.

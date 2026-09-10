@@ -61,7 +61,7 @@
 //! After completing the snapshot we use [`crate::inspect::get_changes_asc`] which will return
 //! all changes between a `[lower, upper)` bound of [`Lsn`]s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -353,7 +353,7 @@ impl<'a, M: SqlServerCdcMetrics> CdcStream<'a, M> {
 
                     // Constraint DDL is absent from `cdc.ddl_history`, so re-read
                     // the tables' definitions whenever the log advanced.
-                    let tables = crate::inspect::get_tables_for_capture_instance(
+                    let tables = crate::inspect::get_captured_tables(
                         self.client,
                         self.capture_instances.keys().map(|instance| instance.as_ref()),
                     )
@@ -365,15 +365,20 @@ impl<'a, M: SqlServerCdcMetrics> CdcStream<'a, M> {
                     let mut constraints =
                         crate::inspect::get_constraints_for_tables(self.client, names.iter())
                             .await?;
+                    let mut missing: BTreeSet<_> = self.capture_instances.keys().cloned().collect();
                     for table in tables {
                         let constraints = constraints
                             .remove(&(Arc::clone(&table.schema_name), Arc::clone(&table.name)))
                             .unwrap_or_default();
+                        missing.remove(&table.capture_instance.name);
                         yield CdcEvent::Schema {
                             capture_instance: Arc::clone(&table.capture_instance.name),
                             table,
                             constraints,
                         };
+                    }
+                    for capture_instance in missing {
+                        yield CdcEvent::TableNotCaptured { capture_instance };
                     }
 
                     // Increment our LSN (`get_changes` is inclusive).
@@ -485,9 +490,10 @@ pub enum CdcEvent {
     /// The current upstream definition of a captured table, read on every
     /// poll that found new changes. SQL Server does not record constraint DDL
     /// in `cdc.ddl_history`, and dropping a constraint advances the log, so
-    /// this is how a dropped constraint becomes visible. A capture instance
-    /// that no longer exists upstream yields nothing; the data poll fails on
-    /// it instead.
+    /// this is how a dropped constraint becomes visible. Only columns the
+    /// capture instance still captures are included, so a column that was
+    /// dropped and added back under the same name is absent: the change table
+    /// keeps its old column and receives NULL for it.
     Schema {
         /// The capture instance.
         capture_instance: Arc<str>,
@@ -495,6 +501,13 @@ pub enum CdcEvent {
         table: SqlServerTableRaw,
         /// The table's PRIMARY KEY and UNIQUE constraints as they are defined now.
         constraints: Vec<SqlServerTableConstraintRaw>,
+    },
+    /// A capture instance the stream was asked to read no longer exists
+    /// upstream: its table was dropped or change data capture was disabled for
+    /// it. Reported from the same read as [`CdcEvent::Schema`].
+    TableNotCaptured {
+        /// The capture instance.
+        capture_instance: Arc<str>,
     },
 }
 

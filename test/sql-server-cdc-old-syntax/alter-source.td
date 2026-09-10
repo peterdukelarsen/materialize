@@ -260,9 +260,9 @@ $ sql-server-execute name=sql-server
 ALTER TABLE table_a DROP COLUMN f2;
 
 ! SELECT * FROM table_a;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.table_a: column "f2" was dropped, renamed, or recreated upstream
 
-> SELECT error ~~ '%Incompatible schema change%' FROM mz_internal.mz_source_statuses WHERE name = 'table_a';
+> SELECT error ~~ '%incompatible schema change on dbo.table_a%' FROM mz_internal.mz_source_statuses WHERE name = 'table_a';
 true
 
 # Subsource errors not propagated to primary source

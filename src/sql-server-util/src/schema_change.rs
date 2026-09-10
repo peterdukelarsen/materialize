@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Upstream constraint changes that Materialize cannot follow.
+//! Upstream schema changes that Materialize cannot follow.
 
 use mz_ore::str::StrExt;
 use postgres_protocol::escape;
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::desc::{SqlServerTableConstraint, SqlServerTableConstraintType};
 
-/// An upstream constraint change that Materialize cannot follow.
+/// An upstream schema change that Materialize cannot follow.
 ///
 /// `Display` renders the diagnosis. [`SchemaChangeError::hint`] renders the
 /// recovery steps, which are surfaced separately: as the `HINT` of a SQL error
@@ -31,6 +31,12 @@ pub struct SchemaChangeError {
 /// The upstream change behind a [`SchemaChangeError`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum SchemaChange {
+    #[error("column {} was dropped, renamed, or recreated upstream", .column.quoted())]
+    ColumnDropped { column: String },
+    #[error("the type of column {} changed upstream", .column.quoted())]
+    ColumnTypeChanged { column: String },
+    #[error("the NOT NULL constraint on column {} was dropped upstream", .column.quoted())]
+    NotNullDropped { column: String },
     #[error("{key} was dropped upstream")]
     KeyDropped { key: KeyRef },
     #[error("{key} was altered upstream")]
@@ -76,24 +82,33 @@ impl std::fmt::Display for KeyRef {
 }
 
 impl SchemaChangeError {
-    /// The recovery steps for the dropped constraint, including the statements
-    /// to run.
-    pub fn hint(&self) -> String {
-        let recreate = format!(
-            "To keep ingesting without this constraint, recreate the table in a new \
-             versioned schema, then swap your views to the new table:\n  CREATE SCHEMA v2;\n  \
-             CREATE TABLE v2.{}\n  FROM SOURCE <source> (REFERENCE {}.{});",
-            escape::escape_identifier(&self.name),
-            escape::escape_identifier(&self.schema_name),
-            escape::escape_identifier(&self.name),
-        );
+    /// The recovery steps for a dropped constraint, including the statements
+    /// to run. Other changes carry no hint.
+    pub fn hint(&self) -> Option<String> {
+        let recreate = |with_clause: Option<&str>| {
+            let mut hint = format!(
+                "To keep ingesting without this constraint, recreate the table in a new \
+                 versioned schema, then swap your views to the new table:\n  CREATE SCHEMA v2;\n  \
+                 CREATE TABLE v2.{}\n  FROM SOURCE <source> (REFERENCE {}.{})",
+                escape::escape_identifier(&self.name),
+                escape::escape_identifier(&self.schema_name),
+                escape::escape_identifier(&self.name),
+            );
+            if let Some(with_clause) = with_clause {
+                hint.push_str(&format!("\n  WITH ({with_clause})"));
+            }
+            hint.push(';');
+            hint
+        };
         match &self.change {
-            SchemaChange::KeyDropped { key } | SchemaChange::KeyAltered { key } => format!(
+            SchemaChange::KeyDropped { key } | SchemaChange::KeyAltered { key } => Some(format!(
                 "{}\nTo make a planned constraint drop a non-event, create the table with \
                  WITH (EXCLUDE CONSTRAINTS ({})) before the upstream drop.",
-                recreate,
+                recreate(None),
                 escape::escape_literal(&key.name),
-            ),
+            )),
+            SchemaChange::NotNullDropped { .. } => Some(recreate(Some("EXCLUDE ALL CONSTRAINTS"))),
+            SchemaChange::ColumnDropped { .. } | SchemaChange::ColumnTypeChanged { .. } => None,
         }
     }
 }

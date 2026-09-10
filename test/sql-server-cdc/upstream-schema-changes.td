@@ -104,7 +104,7 @@ ALTER TABLE foo DROP COLUMN id;
 
 # DROP COLUMN stalls the source
 ! SELECT * FROM foo2;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.foo: column "id" was dropped, renamed, or recreated upstream
 
 > DROP TABLE foo2;
 
@@ -162,27 +162,31 @@ ALTER TABLE bar DROP COLUMN name, location;
 
 # Dropping a non-excluded column stalls the source
 ! SELECT * FROM bar1;
-contains:Incompatible schema change
+contains:incompatible schema change on dbo.bar: column "location" was dropped, renamed, or recreated upstream
 
 #
 # Constraint changes. SQL Server records none of these in cdc.ddl_history, so
-# they are found by the periodic constraint validation rather than by a DDL
-# event.
+# they are found by the periodic schema validation rather than by a DDL event.
 #
 
 $ sql-server-execute name=sql-server
-CREATE TABLE uq (id INT NOT NULL CONSTRAINT uq_pk PRIMARY KEY, wallet VARCHAR(64) NOT NULL CONSTRAINT uq_wallet UNIQUE);
-EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'uq', @role_name = 'SA', @supports_net_changes = 0;
-INSERT INTO uq VALUES (1, 'a');
 CREATE TABLE addk (id INT NOT NULL CONSTRAINT addk_pk PRIMARY KEY, wallet VARCHAR(64) NOT NULL);
 EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'addk', @role_name = 'SA', @supports_net_changes = 0;
 INSERT INTO addk VALUES (1, 'a');
+CREATE TABLE nn (id INT NOT NULL CONSTRAINT nn_pk PRIMARY KEY, note VARCHAR(64), wallet VARCHAR(64) NOT NULL);
+EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'nn', @role_name = 'SA', @supports_net_changes = 0;
+INSERT INTO nn VALUES (1, NULL, 'a');
+CREATE TABLE uq (id INT NOT NULL CONSTRAINT uq_pk PRIMARY KEY, wallet VARCHAR(64) NOT NULL CONSTRAINT uq_wallet UNIQUE);
+EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'uq', @role_name = 'SA', @supports_net_changes = 0;
+INSERT INTO uq VALUES (1, 'a');
+CREATE TABLE readd (id INT NOT NULL CONSTRAINT readd_pk PRIMARY KEY, f2 VARCHAR(10));
+EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'readd', @role_name = 'SA', @supports_net_changes = 0;
+INSERT INTO readd VALUES (1, 'one');
 
-> CREATE TABLE uq FROM SOURCE sql_server_src (REFERENCE dbo.uq);
 > CREATE TABLE addk FROM SOURCE sql_server_src (REFERENCE dbo.addk);
-
-> SELECT * FROM uq;
-1 a
+> CREATE TABLE nn FROM SOURCE sql_server_src (REFERENCE dbo.nn);
+> CREATE TABLE uq FROM SOURCE sql_server_src (REFERENCE dbo.uq);
+> CREATE TABLE readd FROM SOURCE sql_server_src (REFERENCE dbo.readd);
 
 # Adding a UNIQUE constraint upstream, and dropping it again, is not a change:
 # it was never recorded as a key.
@@ -197,9 +201,29 @@ INSERT INTO addk VALUES (3, 'b');
 2 b
 3 b
 
-# Dropping a recorded UNIQUE constraint stalls the table. The hint names the
-# constraint so a planned drop can be excluded up front, and is surfaced in the
-# status.
+> SELECT * FROM nn;
+1 <null> a
+
+# Adding a NOT NULL constraint upstream only narrows the data and is not a change.
+$ sql-server-execute name=sql-server
+UPDATE nn SET note = 'n';
+ALTER TABLE nn ALTER COLUMN note VARCHAR(64) NOT NULL;
+INSERT INTO nn VALUES (2, 'm', 'b');
+
+> SELECT * FROM nn;
+1 n a
+2 m b
+
+# Dropping a NOT NULL constraint stalls the table.
+$ sql-server-execute name=sql-server
+ALTER TABLE nn ALTER COLUMN wallet VARCHAR(64) NULL;
+
+! SELECT * FROM nn;
+contains:incompatible schema change on dbo.nn: the NOT NULL constraint on column "wallet" was dropped upstream
+hint:WITH (EXCLUDE ALL CONSTRAINTS)
+
+# Dropping a UNIQUE constraint stalls the table. The hint names the constraint
+# so a planned drop can be excluded up front, and is surfaced in the status.
 $ sql-server-execute name=sql-server
 ALTER TABLE uq DROP CONSTRAINT uq_wallet;
 
@@ -209,5 +233,14 @@ hint:WITH (EXCLUDE CONSTRAINTS ('uq_wallet')) before the upstream drop
 
 > SELECT details->'hints'->>0 LIKE '%EXCLUDE CONSTRAINTS (''uq_wallet'')%' FROM mz_internal.mz_source_statuses WHERE name = 'uq';
 true
+
+# Dropping a column and adding one back under the same name is not a no-op:
+# the change table keeps the old column and receives NULL for it from then on.
+$ sql-server-execute name=sql-server
+ALTER TABLE readd DROP COLUMN f2;
+ALTER TABLE readd ADD f2 VARCHAR(10);
+
+! SELECT * FROM readd;
+contains:incompatible schema change on dbo.readd: column "f2" was dropped, renamed, or recreated upstream
 
 > DROP SOURCE sql_server_src CASCADE;

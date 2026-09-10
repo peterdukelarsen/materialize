@@ -35,7 +35,7 @@ use mz_repr::{Datum, RelationDesc, Row, RowArena, SqlColumnType, SqlScalarType};
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::desc::proto_sql_server_table_constraint::ConstraintType;
@@ -125,6 +125,74 @@ impl SqlServerTableDesc {
     pub fn decoder(&self, desc: &RelationDesc) -> Result<SqlServerRowDecoder, SqlServerError> {
         let decoder = SqlServerRowDecoder::try_new(self, desc)?;
         Ok(decoder)
+    }
+
+    /// Checks whether the upstream table described by `other` can still be
+    /// ingested into the collection described by `self`.
+    ///
+    /// `self` is the description the export was created with, after `TEXT
+    /// COLUMNS`, `EXCLUDE COLUMNS`, and `EXCLUDE CONSTRAINTS` were applied.
+    /// `other` is a fresh, unmodified description of the same upstream table.
+    pub fn determine_compatibility(
+        &self,
+        other: &SqlServerTableDesc,
+    ) -> Result<(), SchemaChangeError> {
+        self.check_column_compatibility(other)?;
+        self.check_constraint_compatibility(other)
+    }
+
+    /// Checks that every ingested column of `self` is still present upstream
+    /// with a compatible type and nullability.
+    ///
+    /// Added columns and anything about an excluded column are compatible, as
+    /// is a NOT NULL constraint added upstream, which only narrows the data.
+    pub fn check_column_compatibility(
+        &self,
+        other: &SqlServerTableDesc,
+    ) -> Result<(), SchemaChangeError> {
+        let error = |change| SchemaChangeError {
+            schema_name: self.schema_name.to_string(),
+            name: self.name.to_string(),
+            change,
+        };
+        let other_columns: BTreeMap<&str, &SqlServerColumnDesc> =
+            other.columns.iter().map(|c| (c.name.as_ref(), c)).collect();
+
+        for column in self.columns.iter().filter(|c| !c.is_excluded()) {
+            let column_name = || column.name.to_string();
+            let Some(other_column) = other_columns.get(column.name.as_ref()) else {
+                return Err(error(SchemaChange::ColumnDropped {
+                    column: column_name(),
+                }));
+            };
+            let (Some(column_type), Some(other_type)) =
+                (&column.column_type, &other_column.column_type)
+            else {
+                return Err(error(SchemaChange::ColumnTypeChanged {
+                    column: column_name(),
+                }));
+            };
+            // Rows are decoded with `decode_type`, so it must not change. The
+            // Materialize type must also hold every value that decoder
+            // produces, which only constrains bounded types: a column
+            // represented as `String`, natively or through TEXT COLUMNS,
+            // accepts any value.
+            if column.decode_type != other_column.decode_type
+                || (column_type.scalar_type != SqlScalarType::String
+                    && column_type.scalar_type != other_type.scalar_type)
+            {
+                return Err(error(SchemaChange::ColumnTypeChanged {
+                    column: column_name(),
+                }));
+            }
+            if !column_type.nullable && other_type.nullable {
+                return Err(error(SchemaChange::NotNullDropped {
+                    column: column_name(),
+                }));
+            }
+        }
+
+        Ok(())
     }
 
     /// Checks that the constraints recorded in `self` still hold on the
@@ -1294,13 +1362,6 @@ impl SqlServerRowDecoder {
             packer.push(datum);
         }
         Ok(())
-    }
-
-    pub fn included_column_names(&self) -> Vec<Arc<str>> {
-        self.decoders
-            .iter()
-            .map(|decoder| Arc::clone(&decoder.0))
-            .collect()
     }
 }
 
