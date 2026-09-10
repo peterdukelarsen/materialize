@@ -74,7 +74,7 @@ use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use tiberius::numeric::Numeric;
 
-use crate::desc::{SqlServerQualifiedTableName, SqlServerTableRaw};
+use crate::desc::{SqlServerQualifiedTableName, SqlServerTableConstraintRaw, SqlServerTableRaw};
 use crate::inspect::DDLEvent;
 use crate::{Client, SqlServerCdcMetrics, SqlServerError, TransactionIsolationLevel};
 
@@ -351,6 +351,31 @@ impl<'a, M: SqlServerCdcMetrics> CdcStream<'a, M> {
                         }
                     }
 
+                    // Constraint DDL is absent from `cdc.ddl_history`, so re-read
+                    // the tables' definitions whenever the log advanced.
+                    let tables = crate::inspect::get_tables_for_capture_instance(
+                        self.client,
+                        self.capture_instances.keys().map(|instance| instance.as_ref()),
+                    )
+                    .await?;
+                    let names: Vec<_> = tables
+                        .iter()
+                        .map(|table| (Arc::clone(&table.schema_name), Arc::clone(&table.name)))
+                        .collect();
+                    let mut constraints =
+                        crate::inspect::get_constraints_for_tables(self.client, names.iter())
+                            .await?;
+                    for table in tables {
+                        let constraints = constraints
+                            .remove(&(Arc::clone(&table.schema_name), Arc::clone(&table.name)))
+                            .unwrap_or_default();
+                        yield CdcEvent::Schema {
+                            capture_instance: Arc::clone(&table.capture_instance.name),
+                            table,
+                            constraints,
+                        };
+                    }
+
                     // Increment our LSN (`get_changes` is inclusive).
                     //
                     // TODO(sql_server2): We should occassionally check to see how close the LSN we
@@ -456,6 +481,20 @@ pub enum CdcEvent {
         table: SqlServerQualifiedTableName,
         /// DDL event
         ddl_event: DDLEvent,
+    },
+    /// The current upstream definition of a captured table, read on every
+    /// poll that found new changes. SQL Server does not record constraint DDL
+    /// in `cdc.ddl_history`, and dropping a constraint advances the log, so
+    /// this is how a dropped constraint becomes visible. A capture instance
+    /// that no longer exists upstream yields nothing; the data poll fails on
+    /// it instead.
+    Schema {
+        /// The capture instance.
+        capture_instance: Arc<str>,
+        /// The upstream table as it is defined now.
+        table: SqlServerTableRaw,
+        /// The table's PRIMARY KEY and UNIQUE constraints as they are defined now.
+        constraints: Vec<SqlServerTableConstraintRaw>,
     },
 }
 

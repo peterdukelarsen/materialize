@@ -30,6 +30,7 @@ USE test;
 
 > VALIDATE CONNECTION sql_server_test_connection;
 
+
 $ sql-server-execute name=sql-server
 CREATE TABLE add_columns (f1 INTEGER);
 EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'add_columns', @role_name = 'SA', @supports_net_changes = 0;
@@ -197,9 +198,9 @@ INSERT INTO alter_add_pk VALUES (2);
 $ sql-server-execute name=sql-server
 ALTER TABLE alter_drop_unique DROP CONSTRAINT alter_drop_unique_f1_key;
 
-# TODO: This should fail
-# ! SELECT f1 FROM alter_drop_unique;
-# contains:altered
+! SELECT f1 FROM alter_drop_unique;
+contains:incompatible schema change on dbo.alter_drop_unique: UNIQUE constraint "alter_drop_unique_f1_key" (f1) was dropped upstream
+hint:WITH (EXCLUDE CONSTRAINTS ('alter_drop_unique_f1_key')) before the upstream drop
 
 
 #

@@ -9,10 +9,10 @@
 
 #
 # EXCLUDE CONSTRAINTS / EXCLUDE ALL CONSTRAINTS: excluded upstream constraints
-# are not recorded as Materialize keys. NOTE: SQL Server does not allow
-# dropping a PRIMARY KEY while CDC is enabled, and upstream ALTER COLUMN still
-# errors the table regardless of these options, so this test covers key
-# recording and nullability only.
+# are not recorded as Materialize keys, and dropping them upstream is not a
+# schema change. NOTE: SQL Server refuses to drop the index bound to a capture
+# instance, so a PRIMARY KEY drop cannot be exercised here, and upstream ALTER
+# COLUMN still errors the table regardless of these options.
 #
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
@@ -105,6 +105,23 @@ INSERT INTO t27_all VALUES (2, 'd@e.f');
 > SELECT * FROM t27_all;
 1 a@b.c
 2 d@e.f
+
+#
+# Dropping an excluded constraint upstream is a non-event: no key was recorded,
+# so the data stays valid and the table keeps running.
+#
+
+$ sql-server-execute name=sql-server
+ALTER TABLE t27_uniq DROP CONSTRAINT t27_uq_wallet;
+INSERT INTO t27_uniq VALUES (4, 'c');
+
+> SELECT wallet, count(*) FROM t27_uniq GROUP BY wallet;
+a 1
+b 1
+c 2
+
+> SELECT status FROM mz_internal.mz_source_statuses WHERE name = 't27_uniq';
+running
 
 #
 # An empty exclusion list behaves as if the option were omitted.
