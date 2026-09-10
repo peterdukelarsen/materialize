@@ -43,6 +43,11 @@ these columns were never ingested, you can drop them without issue.
 
 If your Materialize source ingests a column, dropping that column from your
 upstream table puts the affected table into an error state.
+{{ if eq $connector "sql-server" }}
+Adding a column with the same name back does not undo this. The capture
+instance keeps its original column and receives `NULL` for it from then on, so
+Materialize treats the recreated column as dropped.
+{{ end }}
 
 - If using the new [`CREATE SOURCE` and `CREATE TABLE FROM
 SOURCE`](/sql/create-source/{{ $connector }}-v2/) syntax, you can safely drop a
@@ -57,34 +62,60 @@ SOURCE ... ADD SUBSOURCE`](/sql/alter-source/).
 
 ### Changing constraints
 
-{{ if ne $connector "sql-server" -}}
-Materialize ignores the following constraint changes: foreign
-key{{ if $is_postgres }}, `CHECK`, and `EXCLUSION`{{ else }} and `CHECK`{{ end }}.
-As such, you can add or drop them without affecting ingestion.
+Materialize records some upstream constraints when a table is created and
+ignores the rest. Only recorded constraints matter afterwards. Adding any
+constraint upstream is a non-event. Dropping an ignored constraint is a
+non-event. Dropping a recorded constraint puts the affected table into an error
+state that names the constraint. Constraints added after the Materialize table
+was created are never recorded, so adding one and later dropping it does not
+affect ingestion.
 
-Materialize also ignores `NOT NULL`, `UNIQUE`, and `PRIMARY KEY` constraints that
-are added after the Materialize table is created (that is, the table was created
-without them). Adding such a constraint, and later dropping it, does not affect
-ingestion.
+{{ if $is_postgres -}}
+| Upstream constraint | Recorded as | Dropping it upstream |
+|---|---|---|
+| `PRIMARY KEY` | A key. Its columns are also non-nullable. | Error state. |
+| `UNIQUE` constraint | A key, which the optimizer can use when every column is `NOT NULL` or the constraint is `NULLS NOT DISTINCT`. | Error state, even when the key was not usable. |
+| Unique index created with `CREATE UNIQUE INDEX`, including partial and expression indexes | Not recorded. | Non-event. |
+| `NOT NULL` | The column's nullability. | Error state. |
+| `CHECK`, `FOREIGN KEY`, `EXCLUDE`, `DEFAULT` | Not recorded. | Non-event. |
 
-Dropping a `NOT NULL`, `UNIQUE`, or `PRIMARY KEY` constraint that existed when
-the table was created puts the affected table into an error state.
+Materialize compares the upstream catalog against the recorded schema every
+few seconds and whenever the replication stream announces a table change, so a
+dropped constraint is reported within seconds.
+{{ else if eq $connector "mysql" -}}
+| Upstream constraint | Recorded as | Dropping it upstream |
+|---|---|---|
+| `PRIMARY KEY`, the index named `PRIMARY` | A key. | Error state. |
+| Unique index over columns, including prefix indexes such as `UNIQUE (name(10))` and `INVISIBLE` indexes | A key, which the optimizer can use when every column is `NOT NULL`. | Error state, even when the key was not usable. Changing an index's visibility is a non-event. |
+| Unique index over an expression | Not recorded. | Non-event. |
+| Non-unique `INDEX`, `FULLTEXT`, `SPATIAL` | Not recorded. | Non-event. |
+| `NOT NULL` | The column's nullability. | Error state. |
+| `CHECK`, `FOREIGN KEY` | Not recorded. | Non-event. |
 
+Materialize checks the upstream schema when the DDL statement appears in the
+binlog, so a dropped constraint is reported as soon as it replicates.
 {{ else -}}
-Materialize ignores foreign key and `CHECK` constraint changes. You can add or
-drop them without affecting ingestion.
+| Upstream constraint | Recorded as | Dropping it upstream |
+|---|---|---|
+| `PRIMARY KEY` | A key. Its columns are also non-nullable. | Refused by SQL Server: the capture instance is bound to the primary key's index, and SQL Server does not allow dropping or disabling that index while the capture instance exists. |
+| `UNIQUE` constraint | A key. | Error state, unless the constraint is the index the capture instance was bound to, which SQL Server refuses to drop. |
+| Unique index created with `CREATE UNIQUE INDEX` | Not recorded. | Non-event. |
+| `NOT NULL` | The column's nullability. | Error state. |
+| `CHECK`, `FOREIGN KEY`, `DEFAULT` | Not recorded. | Non-event. |
 
-Adding a `UNIQUE` constraint does not affect ingestion. Dropping a `UNIQUE`
-constraint puts the affected table into an error state.
+SQL Server does not record constraint changes in `cdc.ddl_history`, so
+Materialize re-reads each table's definition on every poll that finds new
+changes and compares it against the recorded schema. Dropping a constraint
+writes to the log, so a dropped constraint is reported within seconds.
 
-SQL Server does not allow dropping a `PRIMARY KEY` from a table while change data
-capture is enabled on it. A primary key that existed when Materialize began
-ingesting the table therefore cannot be dropped upstream.
-
-Adding or removing a `NOT NULL` constraint on an ingested column requires an
-upstream `ALTER COLUMN`, which puts the affected table into an error state. See
-[Changing a column's data type](#changing-a-columns-data-type).
-{{ end -}}
+Excluding the primary key with `EXCLUDE CONSTRAINTS` is allowed but raises a
+`NOTICE`: it removes the key from the Materialize table, but it cannot make an
+upstream drop a non-event, because SQL Server refuses that drop anyway.
+{{ end }}
+To drop a recorded constraint without interrupting ingestion, recreate the
+Materialize table with the constraint excluded before the upstream drop, using
+`EXCLUDE CONSTRAINTS` for a named `PRIMARY KEY` or `UNIQUE` constraint, or
+`EXCLUDE ALL CONSTRAINTS`, which also covers `NOT NULL`.
 
 ### Changing a column's data type
 
@@ -115,11 +146,17 @@ Any other enum change puts the affected Materialize table into an
 error state, including inserting a value before the end, reordering or renaming
 values, and removing values.
 {{ else if eq $connector "sql-server" -}}
-Any upstream `ALTER COLUMN` on an ingested column puts the affected Materialize
-table into an error state. This covers every `ALTER COLUMN` operation, not just
-data-type changes. Changing a column's collation, sparseness, masking, or
-nullability all error the table the same way. Ingestion for that table stops,
+Changing an ingested column's data type upstream puts the affected Materialize
+table into an error state, unless the column was ingested as `text` via the
+`TEXT COLUMNS` option and the new type is read the same way, for example a
+`decimal` precision or scale change. Widening a bounded type such as
+`varchar(10)` to `varchar(20)` is a type change. Ingestion for that table stops,
 and you must drop and recreate the table in Materialize to resume ingestion.
+
+Other `ALTER COLUMN` changes that keep the column's type and nullability, such
+as its collation, do not affect ingestion. Adding `NOT NULL` does not affect
+ingestion either. Dropping `NOT NULL` is covered under [Changing
+constraints](#changing-constraints).
 {{ end }}
 
 ### Renaming a column
