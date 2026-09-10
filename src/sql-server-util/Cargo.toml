@@ -28,6 +28,7 @@ mz-repr = { path = "../repr" }
 mz-ssh-util = { path = "../ssh-util" }
 mz-cloud-resources = { path = "../cloud-resources" }
 ordered-float.workspace = true
+postgres-protocol.workspace = true
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 prost.workspace = true

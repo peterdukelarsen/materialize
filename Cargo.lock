@@ -8746,6 +8746,7 @@ dependencies = [
  "mz-sql-server-util",
  "mz-ssh-util",
  "ordered-float 5.3.0",
+ "postgres-protocol",
  "proptest",
  "proptest-derive",
  "prost",
