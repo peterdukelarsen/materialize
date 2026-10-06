@@ -86,7 +86,7 @@ use mz_ore::cast::CastFrom;
 use mz_ore::future::InTask;
 use mz_postgres_util::PostgresError;
 use mz_postgres_util::{Client, Sql, execute, query_opt, simple_query_opt, sql};
-use mz_repr::{Datum, DatumVec, Diff, Row};
+use mz_repr::{Datum, DatumVec, Diff, GlobalId, Row};
 use mz_storage_types::dyncfgs::PG_SCHEMA_VALIDATION_INTERVAL;
 use mz_storage_types::dyncfgs::PG_SOURCE_VALIDATE_TIMELINE;
 use mz_storage_types::errors::DataflowError;
@@ -170,11 +170,15 @@ pub(crate) fn render<'scope>(
     let mut rewind_input =
         builder.new_disconnected_input(rewind_stream, Exchange::new(move |_| slot_reader));
     let mut slot_ready_input = builder.new_disconnected_input(slot_ready_stream, Pipeline);
-    let output_uppers = table_info
-        .iter()
-        .flat_map(|(_, outputs)| outputs.values().map(|o| o.resume_upper.clone()))
+    let export_uppers = table_info
+        .values()
+        .flat_map(|outputs| {
+            outputs
+                .values()
+                .map(|o| (o.export_id, o.resume_upper.clone()))
+        })
         .collect::<Vec<_>>();
-    metrics.tables.set(u64::cast_from(output_uppers.len()));
+    metrics.tables.set(u64::cast_from(export_uppers.len()));
 
     let reader_table_info = table_info.clone();
     let (button, transient_errors) = builder.build_fallible(move |caps| {
@@ -287,9 +291,9 @@ pub(crate) fn render<'scope>(
 
             // The overall resumption point for this source is the minimum of the resumption points
             // contributed by each of the outputs.
-            let resume_lsn = output_uppers
+            let resume_lsn = export_uppers
                 .iter()
-                .flat_map(|f| f.elements())
+                .flat_map(|(_, f)| f.elements())
                 .map(|&lsn| {
                     // An output is either an output that has never had data committed to it or one
                     // that has and needs to resume. We differentiate between the two by checking
@@ -310,11 +314,15 @@ pub(crate) fn render<'scope>(
                 std::future::pending::<()>().await;
                 return Ok(());
             };
-            // If we don't set "offset_committed" now, it'll be stuck at 0 (the default value)
-            // until we finish processing the table snapshot. If the snapshot is large, that could be a long time.
-            // This confuses the ingestion lag calculation in the UI, causing it to yield erroneously high values.
-            for stat in config.statistics.values() {
-                stat.set_offset_committed(resume_lsn.offset);
+            // Seed `offset_committed` now, otherwise it stays at 0 until the snapshot finishes,
+            // which for a large snapshot is a long time, and the ingestion lag in the UI is
+            // overstated meanwhile. Statistics that belong to no output, those of the source
+            // itself, take the source-wide resumption point.
+            let committed_seeds =
+                offset_committed_seeds(&export_uppers, slot_metadata.confirmed_flush_lsn);
+            for (id, stat) in config.statistics.iter() {
+                let seed = committed_seeds.get(id).copied().unwrap_or(resume_lsn);
+                stat.set_offset_committed(seed.offset);
             }
             tracing::info!(
                 %id,
@@ -393,6 +401,7 @@ pub(crate) fn render<'scope>(
                 &connection.publication_details.timeline_id,
                 &connection.publication,
                 resume_lsn,
+                &committed_seeds,
                 committed_uppers.as_mut(),
                 &probe_output,
                 &probe_cap[0],
@@ -670,6 +679,7 @@ async fn raw_stream<'a>(
     timeline_id: &'a Option<u64>,
     publication: &'a str,
     resume_lsn: MzOffset,
+    committed_seeds: &'a BTreeMap<GlobalId, MzOffset>,
     uppers: impl futures::Stream<Item = ResumeUppers<MzOffset>> + 'a,
     probe_output: &'a AsyncOutputHandle<MzOffset, CapacityContainerBuilder<Vec<Probe<MzOffset>>>>,
     probe_cap: &'a Capability<MzOffset>,
@@ -864,11 +874,12 @@ async fn raw_stream<'a>(
                             last_committed_upper = *lsn;
                         }
                     }
-                    // `offset_committed` was seeded with `resume_lsn`, so never report below it.
+                    // `offset_committed` was seeded per export, so never report below the seed.
                     for (id, upper) in &uppers.exports {
                         let stat = config.statistics.get(id);
                         if let (Some(lsn), Some(stat)) = (upper.as_option(), stat) {
-                            stat.set_offset_committed(std::cmp::max(*lsn, resume_lsn).offset);
+                            let seed = committed_seeds.get(id).copied().unwrap_or(resume_lsn);
+                            stat.set_offset_committed(std::cmp::max(*lsn, seed).offset);
                         }
                     }
                     Ok(())
@@ -1303,4 +1314,65 @@ fn spawn_schema_validator(
     });
 
     rx
+}
+
+/// The `offset_committed` each export is seeded with until its first committed upper arrives
+/// from the pipeline, keyed by export id.
+///
+/// An export that has never committed anything resumes from the minimum and takes the slot's
+/// `confirmed_flush_lsn`, the earliest LSN replication can start from. Every other export takes
+/// its own resume upper, which is reclocked from its persist upper the same way the pipeline
+/// reclocks the committed uppers it reports from, so the seed is at or above the value the export
+/// last reported and a re-render or restart reports no regression for it. The slot cannot be
+/// ahead of such an upper, because `raw_stream` only feeds back the least committed upper across
+/// all exports, unless it was advanced externally with `pg_replication_slot_advance`. Then the
+/// max picks the slot, and the overcompaction check in `raw_stream` fails the source anyway.
+fn offset_committed_seeds(
+    export_uppers: &[(GlobalId, Antichain<MzOffset>)],
+    slot_lsn: MzOffset,
+) -> BTreeMap<GlobalId, MzOffset> {
+    export_uppers
+        .iter()
+        .filter_map(|(id, upper)| {
+            let upper = upper.as_option()?;
+            Some((*id, std::cmp::max(*upper, slot_lsn)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[mz_ore::test]
+    fn offset_committed_seeds_are_per_export() {
+        let (behind, ahead, added, finished) = (
+            GlobalId::User(1),
+            GlobalId::User(2),
+            GlobalId::User(3),
+            GlobalId::User(4),
+        );
+        let slot = MzOffset::from(90);
+        let export_uppers = vec![
+            (behind, Antichain::from_elem(MzOffset::from(100))),
+            (ahead, Antichain::from_elem(MzOffset::from(120))),
+            (added, Antichain::from_elem(MzOffset::from(0))),
+            (finished, Antichain::new()),
+        ];
+        let seeds = offset_committed_seeds(&export_uppers, slot);
+        assert_eq!(seeds[&behind], MzOffset::from(100));
+        assert_eq!(
+            seeds[&ahead],
+            MzOffset::from(120),
+            "an export is not held back to the least resume upper"
+        );
+        assert_eq!(
+            seeds[&added], slot,
+            "an export that never committed starts at the slot position"
+        );
+        assert!(
+            !seeds.contains_key(&finished),
+            "an export with an empty upper has nothing left to commit"
+        );
+    }
 }
