@@ -97,7 +97,10 @@ use mz_storage_types::AlterCompatible;
 use mz_storage_types::configuration::StorageConfiguration;
 use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::controller::CollectionMetadata;
-use mz_storage_types::dyncfgs::STORAGE_SERVER_MAINTENANCE_INTERVAL;
+use mz_storage_types::dyncfgs::{
+    STORAGE_SERVER_MAINTENANCE_INTERVAL, STORAGE_SUSPEND_AND_RESTART_DELAY,
+    STORAGE_SUSPEND_AND_RESTART_MAX_DELAY,
+};
 use mz_storage_types::oneshot_sources::OneshotIngestionDescription;
 use mz_storage_types::sinks::StorageSinkDesc;
 use mz_storage_types::sources::IngestionDescription;
@@ -270,6 +273,7 @@ impl StorageState {
             txns_ctx,
             sink_tokens: BTreeMap::new(),
             sink_write_frontiers: BTreeMap::new(),
+            restart_delays: BTreeMap::new(),
             dropped_ids: Vec::new(),
             aggregated_statistics: AggregatedStatistics::new(
                 timely_worker_index,
@@ -340,6 +344,8 @@ pub struct StorageState {
     /// Frontier of sink writes (all subsequent writes will be at times at or
     /// equal to this frontier)
     pub sink_write_frontiers: BTreeMap<GlobalId, Rc<RefCell<Antichain<Timestamp>>>>,
+    /// When each source or sink was last rendered and the restart delay it was given.
+    pub restart_delays: BTreeMap<GlobalId, (Instant, Duration)>,
     /// Collection ids that have been dropped but not yet reported as dropped
     pub dropped_ids: Vec<GlobalId>,
 
@@ -414,6 +420,34 @@ impl StorageState {
                 reason: format!("{context}: {e:#}"),
             })
         })
+    }
+
+    /// Returns how long the dataflow being rendered for `id` waits to restart once it halts.
+    pub(crate) fn next_restart_delay(&mut self, id: GlobalId) -> Duration {
+        let config = self.storage_configuration.config_set();
+        let base = STORAGE_SUSPEND_AND_RESTART_DELAY.get(config);
+        let max = STORAGE_SUSPEND_AND_RESTART_MAX_DELAY.get(config);
+        // A token is still present when the controller re-renders a running dataflow, and gone
+        // after `SuspendAndRestart`.
+        let halted = !self.source_tokens.contains_key(&id) && !self.sink_tokens.contains_key(&id);
+        let prev = self.restart_delays.get(&id).filter(|_| halted);
+        // NOTE: The delay is fixed here, so a dataflow keeps it however long it runs before it
+        // halts.
+        let delay = restart_delay(prev.map(|(at, delay)| (at.elapsed(), *delay)), base, max);
+        self.restart_delays.insert(id, (Instant::now(), delay));
+        delay
+    }
+}
+
+/// Returns the restart delay of a dataflow whose predecessor, if it halted, did so `age` after
+/// being rendered with `delay`.
+fn restart_delay(prev: Option<(Duration, Duration)>, base: Duration, max: Duration) -> Duration {
+    match prev {
+        // The predecessor ran for less than `max` before it halted and waited out `delay`.
+        Some((age, delay)) if age < delay.saturating_add(max) => {
+            delay.saturating_mul(2).min(max).max(base)
+        }
+        _ => base,
     }
 }
 
@@ -877,6 +911,7 @@ impl<'w> Worker<'w> {
 
                     self.storage_state.sink_tokens.remove(id);
                     self.storage_state.sink_write_frontiers.remove(id);
+                    self.storage_state.restart_delays.remove(id);
 
                     self.storage_state.aggregated_statistics.deinitialize(*id);
                 }
@@ -1538,5 +1573,26 @@ impl StorageState {
     fn drop_oneshot_ingestion(&mut self, ingestion_id: uuid::Uuid) {
         let prev = self.oneshot_ingestions.remove(&ingestion_id);
         info!(%ingestion_id, existed = %prev.is_some(), "dropping oneshot ingestion");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[mz_ore::test]
+    fn test_restart_delay() {
+        let secs = Duration::from_secs;
+        let (base, max) = (secs(5), secs(30));
+        let mut delays = vec![restart_delay(None, base, max)];
+        for _ in 0..4 {
+            let prev = delays[delays.len() - 1];
+            delays.push(restart_delay(Some((prev + secs(1), prev)), base, max));
+        }
+        assert_eq!(delays, [5, 10, 20, 30, 30].map(secs), "doubles up to max");
+        let healthy = Some((max + max, max));
+        assert_eq!(restart_delay(healthy, base, max), base, "starts over");
+        let disabled = restart_delay(Some((secs(1), base)), base, Duration::ZERO);
+        assert_eq!(disabled, base, "max below base");
     }
 }
