@@ -37,6 +37,7 @@ use timely::order::{PartialOrder, TotalOrder};
 use timely::progress::frontier::MutableAntichain;
 use timely::progress::{Antichain, Timestamp};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::source::types::SourceRender;
 
@@ -61,6 +62,9 @@ pub enum AsyncStorageWorkerCommand<T> {
     /// This command is used to properly order create and drop of dataflows.
     /// Currently, this is a no-op in AsyncStorageWorker.
     ForwardDropDataflow(GlobalId),
+
+    /// Respond with `RestartDue` once the given time has come.
+    ForwardRestartDue(GlobalId, Instant),
 }
 
 /// Responses from [AsyncStorageWorker].
@@ -92,6 +96,9 @@ pub enum AsyncStorageWorkerResponse<T: Timestamp + Lattice + Codec64> {
 
     /// Indicates data flow can be dropped.
     DropDataflow(GlobalId),
+
+    /// The restart of a source or sink that was deferred until the given time is due.
+    RestartDue(GlobalId, Instant),
 }
 
 async fn reclock_resume_uppers<C, IntoTime>(
@@ -211,7 +218,7 @@ impl<T: Timestamp + TimestampManipulation + Lattice + Codec64 + Display + Sync>
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = crossbeam_channel::unbounded();
 
-        let response_tx = ActivatingSender::new(response_tx, thread);
+        let response_tx = Arc::new(ActivatingSender::new(response_tx, thread));
 
         mz_ore::task::spawn(|| "AsyncStorageWorker", async move {
             while let Some(command) = command_rx.recv().await {
@@ -461,6 +468,15 @@ impl<T: Timestamp + TimestampManipulation + Lattice + Codec64 + Display + Sync>
                             break;
                         }
                     }
+                    AsyncStorageWorkerCommand::ForwardRestartDue(id, deadline) => {
+                        let response_tx = Arc::clone(&response_tx);
+                        // Waits in its own task, because waiting here would hold up later commands.
+                        mz_ore::task::spawn(|| "deferred_restart", async move {
+                            tokio::time::sleep_until(deadline).await;
+                            let _ = response_tx
+                                .send(AsyncStorageWorkerResponse::RestartDue(id, deadline));
+                        });
+                    }
                 }
             }
             tracing::trace!("shutting down async storage worker task");
@@ -499,6 +515,11 @@ impl<T: Timestamp + TimestampManipulation + Lattice + Codec64 + Display + Sync>
     /// ordering of creating and dropping data flows.
     pub fn drop_dataflow(&self, id: GlobalId) {
         self.send(AsyncStorageWorkerCommand::ForwardDropDataflow(id))
+    }
+
+    /// Requests a `RestartDue` response for `id` at `deadline`.
+    pub fn restart_due_at(&self, id: GlobalId, deadline: Instant) {
+        self.send(AsyncStorageWorkerCommand::ForwardRestartDue(id, deadline))
     }
 
     fn send(&self, cmd: AsyncStorageWorkerCommand<T>) {
