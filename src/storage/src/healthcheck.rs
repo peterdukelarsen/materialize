@@ -9,19 +9,20 @@
 
 //! Healthcheck common
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Debug;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use differential_dataflow::Hashable;
 use futures::StreamExt;
 use mz_ore::cast::CastFrom;
 use mz_ore::now::NowFn;
+use mz_persist::retry::{Retry, RetryStream};
 use mz_repr::GlobalId;
 use mz_storage_client::client::{Status, StatusUpdate};
 use mz_timely_util::builder_async::{
@@ -329,6 +330,27 @@ pub struct HealthStatusMessage {
     pub update: HealthStatusUpdate,
 }
 
+/// The delay before a halted dataflow restarts, which doubles with jitter on each consecutive halt.
+pub(crate) struct RestartBackoff {
+    /// The delay series, which only grows if `clamp_backoff` exceeds `initial_backoff`.
+    pub retry: Retry,
+    /// The position in the series, shared across the restarts of one source or sink.
+    pub stream: Rc<Cell<Option<RetryStream>>>,
+}
+
+impl RestartBackoff {
+    /// Takes the series of a dataflow that halted after running for `uptime`, if the backoff is on.
+    fn take(&self, uptime: Duration) -> Option<RetryStream> {
+        let max = self.retry.clamp_backoff;
+        // A dataflow that stayed up for `max` is not in a restart loop, and a series that
+        // exceeds `max` predates a lowered limit.
+        let stream = self.stream.take();
+        let stream = stream.filter(|s| uptime < max && s.next_sleep() <= max);
+        (max > self.retry.initial_backoff)
+            .then(|| stream.unwrap_or_else(|| self.retry.clone().into_retry_stream()))
+    }
+}
+
 /// Writes updates that come across `health_stream` to the collection's status shards, as identified
 /// by their `CollectionMetadata`.
 ///
@@ -354,7 +376,7 @@ pub(crate) fn health_operator<'scope, T: Timestamp, P>(
     write_namespaced_map: bool,
     // How long to wait before initiating a `SuspendAndRestart` command, to
     // prevent hot restart loops.
-    suspend_and_restart_delay: Duration,
+    restart_backoff: RestartBackoff,
 ) -> PressOnDropButton
 where
     P: HealthOperator + 'static,
@@ -385,6 +407,10 @@ where
     );
 
     let button = health_op.build(move |mut _capabilities| async move {
+        // Taken by the first halt, because each later health update of a halted object halts
+        // it again and must not advance the backoff a second time.
+        let mut started_at = Some(Instant::now());
+
         let mut health_states: BTreeMap<_, _> = mark_starting
             .iter()
             .copied()
@@ -504,12 +530,23 @@ where
                         halting_id
                     );
 
+                    let backoff = started_at
+                        .take()
+                        .and_then(|at| restart_backoff.take(at.elapsed()));
+                    let delay = backoff
+                        .as_ref()
+                        .map_or(restart_backoff.retry.initial_backoff, |b| b.next_sleep());
                     info!(
                         "Broadcasting suspend-and-restart \
                         command because of {:?} after {:?} delay",
-                        halt_with, suspend_and_restart_delay
+                        halt_with, delay
                     );
-                    tokio::time::sleep(suspend_and_restart_delay).await;
+                    match backoff {
+                        // NOTE: Dropping the dataflow during this sleep drops the series with
+                        // it, so the backoff starts over.
+                        Some(backoff) => restart_backoff.stream.set(Some(backoff.sleep().await)),
+                        None => tokio::time::sleep(delay).await,
+                    }
                     health_operator_impl.send_halt(id, halt_with);
                 }
             }
@@ -585,6 +622,45 @@ impl HealthStatusUpdate {
 mod tests {
     use super::*;
     use itertools::Itertools;
+
+    fn restart_backoff(max: Duration) -> RestartBackoff {
+        RestartBackoff {
+            retry: Retry {
+                fixed_sleep: Duration::ZERO,
+                initial_backoff: Duration::from_secs(5),
+                multiplier: 2,
+                clamp_backoff: max,
+                seed: 0,
+            },
+            stream: Default::default(),
+        }
+    }
+
+    #[mz_ore::test(tokio::test(start_paused = true))]
+    async fn test_restart_backoff() {
+        let secs = Duration::from_secs;
+        let backoff = restart_backoff(secs(30));
+        let mut delays = vec![];
+        for _ in 0..5 {
+            let stream = backoff.take(secs(1)).expect("backoff is on");
+            delays.push(stream.next_sleep());
+            backoff.stream.set(Some(stream.sleep().await));
+        }
+        assert_eq!(delays, [5, 10, 20, 30, 30].map(secs), "doubles up to max");
+
+        let lowered = RestartBackoff {
+            stream: Rc::clone(&backoff.stream),
+            ..restart_backoff(secs(10))
+        };
+        let stream = lowered.take(secs(1)).expect("backoff is on");
+        assert_eq!(stream.next_sleep(), secs(5), "starts over under lower max");
+        backoff.stream.set(Some(stream.sleep().await));
+        let stream = backoff.take(secs(30)).expect("backoff is on");
+        assert_eq!(stream.next_sleep(), secs(5), "starts over once healthy");
+
+        let off = restart_backoff(secs(5));
+        assert!(off.take(secs(1)).is_none(), "max at initial turns it off");
+    }
 
     // Actual timely tests for `health_operator`.
 
@@ -1107,7 +1183,7 @@ mod tests {
                                     input_mapping: inputs,
                                 },
                                 write_namespaced_map,
-                                Duration::from_secs(5),
+                                restart_backoff(Duration::ZERO),
                             )));
                         });
                 });
