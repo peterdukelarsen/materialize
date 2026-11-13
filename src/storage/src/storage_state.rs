@@ -97,7 +97,10 @@ use mz_storage_types::AlterCompatible;
 use mz_storage_types::configuration::StorageConfiguration;
 use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::controller::CollectionMetadata;
-use mz_storage_types::dyncfgs::STORAGE_SERVER_MAINTENANCE_INTERVAL;
+use mz_storage_types::dyncfgs::{
+    STORAGE_SERVER_MAINTENANCE_INTERVAL, STORAGE_SUSPEND_AND_RESTART_DELAY,
+    STORAGE_SUSPEND_AND_RESTART_MAX_DELAY,
+};
 use mz_storage_types::oneshot_sources::OneshotIngestionDescription;
 use mz_storage_types::sinks::StorageSinkDesc;
 use mz_storage_types::sources::IngestionDescription;
@@ -283,6 +286,7 @@ impl StorageState {
             read_only_tx,
             read_only_rx,
             async_worker,
+            restart_backoff: Default::default(),
             storage_configuration,
             dataflow_parameters: DataflowParameters::new(
                 shared_rocksdb_write_buffer_manager,
@@ -389,6 +393,9 @@ pub struct StorageState {
     /// the timely main loop cannot do.
     pub async_worker: AsyncStorageWorker<mz_repr::Timestamp>,
 
+    /// Used on worker 0 only, which is the worker that requests restarts.
+    restart_backoff: RestartBackoff,
+
     /// Configuration for source and sink connections.
     pub storage_configuration: StorageConfiguration,
     /// Dynamically configurable parameters that control how dataflows are rendered.
@@ -414,6 +421,76 @@ impl StorageState {
                 reason: format!("{context}: {e:#}"),
             })
         })
+    }
+
+    /// Restarts the suspended source or sink `id`, later if it keeps halting.
+    fn restart_with_backoff(&mut self, id: GlobalId) {
+        let config = self.storage_configuration.config_set();
+        let base = STORAGE_SUSPEND_AND_RESTART_DELAY.get(config);
+        let max = STORAGE_SUSPEND_AND_RESTART_MAX_DELAY.get(config);
+        let now = Instant::now();
+        match self.restart_backoff.halt(id, now, base, max) {
+            // NOTE: An object halted through `error_handler` keeps its last status while it waits.
+            Some(due) => {
+                info!("deferring restart of {id} by {:?}", due - now);
+                self.async_worker.restart_due_at(id, due);
+            }
+            None => self.restart(id),
+        }
+    }
+
+    /// Requests fresh frontiers for the source or sink `id`, which re-renders its dataflow.
+    fn restart(&self, id: GlobalId) {
+        if let Some(description) = self.ingestions.get(&id) {
+            self.async_worker
+                .update_ingestion_frontiers(id, description.clone());
+        } else if let Some(description) = self.exports.get(&id) {
+            self.async_worker
+                .update_sink_frontiers(id, description.clone());
+        }
+    }
+}
+
+/// Backoff of the restarts of sources and sinks that keep halting.
+#[derive(Debug, Default)]
+struct RestartBackoff {
+    /// Per object, how many halts in a row preceded its latest one and when its restart is due.
+    restarts: BTreeMap<GlobalId, (u32, Instant)>,
+}
+
+impl RestartBackoff {
+    /// Records that `id` halted at `now` and returns when to restart it, or `None` for right away.
+    fn halt(
+        &mut self,
+        id: GlobalId,
+        now: Instant,
+        base: Duration,
+        max: Duration,
+    ) -> Option<Instant> {
+        if max <= base {
+            return None;
+        }
+        let halts = match self.restarts.get(&id) {
+            // A dataflow that halts within `max` of its restart is in a restart loop.
+            Some((halts, due)) if now.saturating_duration_since(*due) < max => halts + 1,
+            _ => 0,
+        };
+        let factor = 1u32.checked_shl(halts).unwrap_or(u32::MAX);
+        // The health operator waits `base` before it requests a restart, so only the rest is
+        // waited here.
+        let due = now + base.saturating_mul(factor).min(max).saturating_sub(base);
+        self.restarts.insert(id, (halts, due));
+        (due > now).then_some(due)
+    }
+
+    /// Returns whether the restart of `id` that was deferred until `due` is still wanted.
+    fn is_due(&self, id: GlobalId, due: Instant) -> bool {
+        self.restarts.get(&id).map(|(_, latest)| *latest) == Some(due)
+    }
+
+    /// Forgets `id`, which cancels its deferred restart, for when it is dropped or rendered anew.
+    fn forget(&mut self, id: GlobalId) {
+        self.restarts.remove(&id);
     }
 }
 
@@ -619,6 +696,15 @@ impl<'w> Worker<'w> {
                     .internal_cmd_tx
                     .send(InternalStorageCommand::DropDataflow(vec![id]));
             }
+            AsyncStorageWorkerResponse::RestartDue(id, due) => {
+                let state = &self.storage_state;
+                // A command that raced the halt may have rendered the dataflow already.
+                let rendered =
+                    state.source_tokens.contains_key(&id) || state.sink_tokens.contains_key(&id);
+                if state.restart_backoff.is_due(id, due) && !rendered {
+                    state.restart(id);
+                }
+            }
         }
     }
 
@@ -661,17 +747,14 @@ impl<'w> Worker<'w> {
                                 .aggregated_statistics
                                 .advance_global_epoch(*id);
                         }
-                        self.storage_state
-                            .async_worker
-                            .update_ingestion_frontiers(id, ingestion_description);
+                        self.storage_state.restart_with_backoff(id);
                     }
 
                     // Continue with other commands.
                     return;
                 }
 
-                let maybe_sink = self.storage_state.exports.get(&id).cloned();
-                if let Some(sink_description) = maybe_sink {
+                if self.storage_state.exports.contains_key(&id) {
                     // Yank the token of the previously existing sink
                     // dataflow.
                     let maybe_token = self.storage_state.sink_tokens.remove(&id);
@@ -689,9 +772,7 @@ impl<'w> Worker<'w> {
                         self.storage_state
                             .aggregated_statistics
                             .advance_global_epoch(id);
-                        self.storage_state
-                            .async_worker
-                            .update_sink_frontiers(id, sink_description);
+                        self.storage_state.restart_with_backoff(id);
                     }
 
                     // Continue with other commands.
@@ -1420,6 +1501,7 @@ impl StorageState {
                 // Remember the ingestion description to facilitate possible
                 // reconciliation later.
                 self.ingestions.insert(id, description.clone());
+                self.restart_backoff.forget(id);
 
                 // Initialize shared frontier reporting.
                 for id in description.collection_ids() {
@@ -1461,6 +1543,7 @@ impl StorageState {
                 // Remember the sink description to facilitate possible
                 // reconciliation later.
                 let prev = self.exports.insert(export.id, export.description.clone());
+                self.restart_backoff.forget(export.id);
 
                 // New sink, add state.
                 if prev.is_none() {
@@ -1501,6 +1584,7 @@ impl StorageState {
 
         self.ingestions.remove(&id);
         self.exports.remove(&id);
+        self.restart_backoff.forget(id);
 
         let _ = self.latest_status_updates.remove(&id);
 
@@ -1538,5 +1622,34 @@ impl StorageState {
     fn drop_oneshot_ingestion(&mut self, ingestion_id: uuid::Uuid) {
         let prev = self.oneshot_ingestions.remove(&ingestion_id);
         info!(%ingestion_id, existed = %prev.is_some(), "dropping oneshot ingestion");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[mz_ore::test]
+    fn test_restart_backoff() {
+        let secs = Duration::from_secs;
+        let (id, base, max) = (GlobalId::User(1), secs(5), secs(30));
+        let mut backoff = RestartBackoff::default();
+
+        // Each restart halts again as soon as it is issued.
+        let mut now = Instant::now();
+        let mut waits = vec![];
+        for _ in 0..5 {
+            let due = backoff.halt(id, now, base, max).unwrap_or(now);
+            waits.push(due - now);
+            now = due;
+        }
+        assert_eq!(waits, [0, 5, 15, 25, 25].map(secs), "doubles up to max");
+        assert!(backoff.is_due(id, now), "latest restart");
+        assert!(!backoff.is_due(id, now - secs(25)), "superseded restart");
+
+        assert_eq!(backoff.halt(id, now + max, base, max), None, "starts over");
+        backoff.forget(id);
+        assert!(!backoff.is_due(id, now + max), "forgotten restart");
+        assert_eq!(backoff.halt(id, now, base, base), None, "max at base");
     }
 }
