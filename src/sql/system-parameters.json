@@ -4244,6 +4244,15 @@
       "dyncfg": true
     },
     {
+      "name": "storage_suspend_and_restart_max_delay",
+      "typeName": "duration",
+      "default": "0 s",
+      "description": "Cap that `storage_suspend_and_restart_delay` doubles up to each time a source / sink halts again before it has run for this long. A value at or below that delay disables the backoff.",
+      "scope": "replica",
+      "userVisible": false,
+      "dyncfg": true
+    },
+    {
       "name": "storage_upsert_max_snapshot_batch_buffering",
       "typeName": "optional unsigned integer",
       "default": "",
