@@ -46,6 +46,7 @@ mz-interchange = { path = "../interchange" }
 mz-kafka-util = { path = "../kafka-util" }
 mz-mysql-util = { path = "../mysql-util" }
 mz-ore = { path = "../ore", features = ["async", "tracing", "chrono", "metrics", "columnar", "columnation"] }
+mz-persist = { path = "../persist" }
 mz-persist-client = { path = "../persist-client" }
 mz-persist-types = { path = "../persist-types" }
 mz-pgcopy = { path = "../pgcopy" }
@@ -94,7 +95,6 @@ axum.workspace = true
 clap = { workspace = true, features = ["env"] }
 humantime.workspace = true
 mz-build-info = { path = "../build-info" }
-mz-persist = { path = "../persist" }
 mz-http-util = { path = "../http-util" }
 mz-orchestrator-tracing = { path = "../orchestrator-tracing" }
 itertools.workspace = true

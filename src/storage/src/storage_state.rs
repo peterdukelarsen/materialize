@@ -73,7 +73,7 @@
 //! update, is that it might fill out new internal state in the mid-level
 //! clients on the way toward being run.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -81,10 +81,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use differential_dataflow::Hashable;
 use fail::fail_point;
 use mz_ore::now::NowFn;
 use mz_ore::soft_assert_or_log;
 use mz_ore::tracing::TracingHandle;
+use mz_persist::retry::{Retry, RetryStream};
 use mz_persist_client::batch::ProtoBatch;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::operators::shard_source::ErrorHandler;
@@ -97,7 +99,10 @@ use mz_storage_types::AlterCompatible;
 use mz_storage_types::configuration::StorageConfiguration;
 use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::controller::CollectionMetadata;
-use mz_storage_types::dyncfgs::STORAGE_SERVER_MAINTENANCE_INTERVAL;
+use mz_storage_types::dyncfgs::{
+    STORAGE_SERVER_MAINTENANCE_INTERVAL, STORAGE_SUSPEND_AND_RESTART_DELAY,
+    STORAGE_SUSPEND_AND_RESTART_MAX_DELAY,
+};
 use mz_storage_types::oneshot_sources::OneshotIngestionDescription;
 use mz_storage_types::sinks::StorageSinkDesc;
 use mz_storage_types::sources::IngestionDescription;
@@ -113,6 +118,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::healthcheck::RestartBackoff;
 use crate::internal_control::{
     self, DataflowParameters, InternalCommandReceiver, InternalCommandSender,
     InternalStorageCommand,
@@ -270,6 +276,7 @@ impl StorageState {
             txns_ctx,
             sink_tokens: BTreeMap::new(),
             sink_write_frontiers: BTreeMap::new(),
+            restart_backoffs: BTreeMap::new(),
             dropped_ids: Vec::new(),
             aggregated_statistics: AggregatedStatistics::new(
                 timely_worker_index,
@@ -340,6 +347,9 @@ pub struct StorageState {
     /// Frontier of sink writes (all subsequent writes will be at times at or
     /// equal to this frontier)
     pub sink_write_frontiers: BTreeMap<GlobalId, Rc<RefCell<Antichain<Timestamp>>>>,
+    /// Restart delay series per source or sink, kept here because every restart re-renders
+    /// the dataflow that advances it.
+    pub restart_backoffs: BTreeMap<GlobalId, Rc<Cell<Option<RetryStream>>>>,
     /// Collection ids that have been dropped but not yet reported as dropped
     pub dropped_ids: Vec<GlobalId>,
 
@@ -414,6 +424,22 @@ impl StorageState {
                 reason: format!("{context}: {e:#}"),
             })
         })
+    }
+
+    /// Returns the restart backoff of the source or sink `id`.
+    pub(crate) fn restart_backoff(&mut self, id: GlobalId) -> RestartBackoff {
+        let config = self.storage_configuration.config_set();
+        RestartBackoff {
+            retry: Retry {
+                fixed_sleep: Duration::ZERO,
+                initial_backoff: STORAGE_SUSPEND_AND_RESTART_DELAY.get(config),
+                multiplier: 2,
+                clamp_backoff: STORAGE_SUSPEND_AND_RESTART_MAX_DELAY.get(config),
+                // Seeded by id so that objects that halt together do not restart in lockstep.
+                seed: id.hashed(),
+            },
+            stream: Rc::clone(self.restart_backoffs.entry(id).or_default()),
+        }
     }
 }
 
@@ -877,6 +903,7 @@ impl<'w> Worker<'w> {
 
                     self.storage_state.sink_tokens.remove(id);
                     self.storage_state.sink_write_frontiers.remove(id);
+                    self.storage_state.restart_backoffs.remove(id);
 
                     self.storage_state.aggregated_statistics.deinitialize(*id);
                 }
