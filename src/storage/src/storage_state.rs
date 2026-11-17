@@ -740,7 +740,6 @@ impl<'w> Worker<'w> {
                     );
                     return;
                 }
-                // Nothing brings the dataflow back on its own, so this is louder than a restart.
                 warn!(
                     "worker {}/{} suspending {id} because of: {reason}",
                     self.timely_worker.index(),

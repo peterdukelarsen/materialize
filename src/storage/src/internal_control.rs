@@ -73,8 +73,7 @@ pub enum InternalStorageCommand {
         /// The reason for the restart request.
         reason: String,
     },
-    /// Suspend the dataflow identified by the `GlobalId` without restarting it. It stays down
-    /// until the controller issues its run command again.
+    /// Suspend the dataflow identified by the `GlobalId` until its run command is issued again.
     Suspend {
         /// The id of the dataflow that should be suspended.
         id: GlobalId,

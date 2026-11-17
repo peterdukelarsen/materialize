@@ -313,7 +313,6 @@ def workflow_alter_table_add_column(c: Composition) -> None:
     assert (
         "zip_eq" not in logs.stdout
     ), "storage worker panicked in ArrowBuilder::add_row"
-    # A sink that only wedges on the mismatch keeps buffering its input.
     assert re.search(
         r"suspending \S+ because of: .*schema does not match expected schema",
         logs.stdout,

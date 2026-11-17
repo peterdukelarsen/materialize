@@ -95,7 +95,7 @@ $ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=10s
         AND h.error LIKE '%schema does not match expected schema%';
 true
 
-# A restart cannot fix the mismatch, so the sink stalls once and stays there.
+# The sink stalls once, without restarting.
 > SELECT status FROM mz_internal.mz_sink_statuses WHERE name = 'evolve_sink_v2';
 stalled
 

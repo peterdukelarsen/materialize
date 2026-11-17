@@ -567,11 +567,11 @@ pub enum HealthStatusUpdate {
     Ord
 )]
 pub enum StallAction {
-    /// The dataflow keeps running and can report a recovery.
+    /// The dataflow keeps running.
     Continue,
     /// The dataflow is torn down and rendered again.
     Restart,
-    /// The dataflow is torn down and stays down until its run command is issued again.
+    /// The dataflow is torn down and not rendered again.
     Suspend,
 }
 
@@ -599,11 +599,7 @@ impl HealthStatusUpdate {
         }
     }
 
-    /// Generates a suspending [`HealthStatusUpdate`] with `update`, for an error that a restart
-    /// cannot fix.
-    ///
-    /// NOTE: an operator that only wedges after such an error keeps buffering its input, so the
-    /// dataflow has to be torn down to bound its memory.
+    /// Generates a suspending [`HealthStatusUpdate`] with `update`.
     pub(crate) fn suspending(error: String, hint: Option<String>) -> Self {
         HealthStatusUpdate::Stalled {
             error,
